@@ -207,6 +207,7 @@ where
         {
             Ok(v) => Ok(v),
             Err(e) => {
+                println!("Error polling state: {:?}", e);
                 // if e is disconnect, then purge state and reconnect
                 // for now, assume all errors are disconnects
                 // TODO: test this!
@@ -288,7 +289,7 @@ impl Enqueuer {
         let (tx, rx) = oneshot::channel();
         match self.0.unbounded_send((request, tx)) {
             Ok(()) => {
-                Either::A(rx.map_err(|e| format_err!("failed to enqueue new request: {:?}", e)))
+                Either::A(rx.map_err(|e| format_err!("Error processing request: {:?}", e)))
             }
             Err(e) => {
                 Either::B(Err(format_err!("failed to enqueue new request: {:?}", e)).into_future())
