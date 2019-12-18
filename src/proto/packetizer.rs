@@ -201,77 +201,7 @@ where
             }
         }
 
-        match self
-            .state
-            .poll(self.exiting, &mut self.logger, &mut self.default_watcher)
-        {
-            Ok(v) => Ok(v),
-            Err(e) => {
-                // if e is disconnect, then purge state and reconnect
-                // for now, assume all errors are disconnects
-                // TODO: test this!
-
-                let password = if let PacketizerState::Connected(ActivePacketizer {
-                    ref mut password,
-                    ..
-                }) = self.state
-                {
-                    password.split_off(0)
-                } else {
-                    // XXX: error while connecting -- don't recurse (for now)
-                    return Err(e);
-                };
-
-                if let PacketizerState::Connected(ActivePacketizer {
-                    last_zxid_seen,
-                    session_id,
-                    ..
-                }) = self.state
-                {
-                    info!(self.logger, "connection lost; reconnecting";
-                          "session_id" => session_id,
-                          "last_zxid" => last_zxid_seen
-                    );
-
-                    let xid = self.xid;
-                    self.xid += 1;
-
-                    let log = self.logger.clone();
-                    let retry = S::connect(&self.addr)
-                        .map_err(|e| e.into())
-                        .map(move |stream| {
-                            let request = Request::Connect {
-                                protocol_version: 0,
-                                last_zxid_seen,
-                                timeout: 0,
-                                session_id,
-                                passwd: password,
-                                read_only: false,
-                            };
-                            trace!(log, "about to handshake (again)");
-
-                            let (tx, rx) = oneshot::channel();
-                            tokio::spawn(rx.then(move |r| {
-                                trace!(log, "re-connection response: {:?}", r);
-                                Ok(())
-                            }));
-
-                            let mut ap = ActivePacketizer::new(stream);
-                            ap.enqueue(xid, request, tx);
-                            ap
-                        });
-
-                    // dropping the old state will also cancel in-flight requests
-                    mem::replace(
-                        &mut self.state,
-                        PacketizerState::Reconnecting(Box::new(retry)),
-                    );
-                    self.poll()
-                } else {
-                    unreachable!();
-                }
-            }
-        }
+        self.state.poll(self.exiting, &mut self.logger, &mut self.default_watcher)
     }
 }
 
