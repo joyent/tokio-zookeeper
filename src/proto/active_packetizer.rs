@@ -298,7 +298,10 @@ where
                     self.first = false;
 
                     // find the waiting request future
-                    let (opcode, tx) = self.reply.remove(&xid).unwrap(); // TODO: return an error if xid was unknown
+                    let (opcode, tx) = match self.reply.remove(&xid) {
+                        Some(tuple) => tuple,
+                        None => bail!("No waiting request future found for xid {:?}", xid)
+                    };
 
                     if let Some(w) = self.pending_watchers.remove(&xid) {
                         // normally, watches are *only* added for successful operations
@@ -395,7 +398,7 @@ where
             self.timer.reset(time::Instant::now() + self.timeout);
         }
 
-        trace!(logger, "poll_read");
+        trace!(logger, "poll_write");
         let w = self.poll_write(exiting, logger)?;
 
         match (r, w) {
