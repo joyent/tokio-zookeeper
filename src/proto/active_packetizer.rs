@@ -398,7 +398,7 @@ where
             self.timer.reset(time::Instant::now() + self.timeout);
         }
 
-        trace!(logger, "poll_read");
+        trace!(logger, "poll_write");
         let w = self.poll_write(exiting, logger)?;
 
         match (r, w) {
