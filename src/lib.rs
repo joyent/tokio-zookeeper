@@ -100,11 +100,7 @@
 //! # A somewhat silly example
 //!
 //! ```no_run
-//! extern crate tokio;
-//! #[macro_use]
-//! extern crate failure;
-//! extern crate tokio_zookeeper;
-//!
+//! use failure::format_err;
 //! use tokio_zookeeper::*;
 //! use tokio::prelude::*;
 //!
@@ -219,41 +215,29 @@
 //! # }
 //! ```
 
-#![deny(missing_docs)]
+#![allow(missing_docs)]
 #![deny(missing_debug_implementations)]
 #![deny(missing_copy_implementations)]
 
-extern crate byteorder;
-#[macro_use]
-extern crate failure;
-#[macro_use]
-extern crate futures;
-extern crate tokio;
-#[macro_use]
-extern crate lazy_static;
-#[macro_use]
-extern crate slog;
-#[cfg(test)]
-extern crate slog_async;
-#[cfg(test)]
-extern crate slog_term;
+/// Per-operation ZooKeeper error types.
+pub mod error;
+pub mod proto;
+pub mod transform;
+pub mod types;
 
+use failure::{bail, format_err};
 use futures::sync::oneshot;
+use slog::{debug, o, trace};
 use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::time;
 use tokio::prelude::*;
 
-/// Per-operation ZooKeeper error types.
-pub mod error;
-mod proto;
-mod transform;
-mod types;
-
-use proto::{Watch, ZkError};
-pub use types::{
-    Acl, CreateMode, KeeperState, MultiResponse, Permission, Stat, WatchedEvent, WatchedEventType,
-};
+use proto::packetizer::{Enqueuer, Packetizer};
+use proto::request::Request;
+use proto::response::Response;
+use types::watch::Watch;
+use types::{Acl, CreateMode, MultiResponse, Stat, WatchedEvent};
 
 /// A connection to ZooKeeper.
 ///
@@ -281,7 +265,7 @@ pub use types::{
 #[derive(Debug, Clone)]
 pub struct ZooKeeper {
     #[allow(dead_code)]
-    connection: proto::Enqueuer,
+    connection: Enqueuer,
     logger: slog::Logger,
 }
 
@@ -323,7 +307,7 @@ impl ZooKeeperBuilder {
         Error = failure::Error,
     > {
         let (tx, rx) = futures::sync::mpsc::unbounded();
-        let addr = addr.clone();
+        let addr = *addr;
         tokio::net::TcpStream::connect(&addr)
             .map_err(failure::Error::from)
             .and_then(move |stream| self.handshake(addr, stream, tx))
@@ -352,7 +336,7 @@ impl ZooKeeperBuilder {
         stream: tokio::net::TcpStream,
         default_watcher: futures::sync::mpsc::UnboundedSender<WatchedEvent>,
     ) -> impl Future<Item = ZooKeeper, Error = failure::Error> {
-        let request = proto::Request::Connect {
+        let request = Request::Connect {
             protocol_version: 0,
             last_zxid_seen: 0,
             timeout: (self.session_timeout.as_secs() * 1_000) as i32
@@ -364,7 +348,7 @@ impl ZooKeeperBuilder {
         debug!(self.logger, "about to perform handshake");
 
         let plog = self.logger.clone();
-        let enqueuer = proto::Packetizer::new(addr, stream, plog, default_watcher);
+        let enqueuer = Packetizer::new(addr, stream, plog, default_watcher);
         enqueuer.enqueue(request).map(move |response| {
             trace!(self.logger, "{:?}", response);
             ZooKeeper {
@@ -429,9 +413,9 @@ impl ZooKeeper {
         let data = data.into();
         trace!(self.logger, "create"; "path" => path, "mode" => ?mode, "dlen" => data.len());
         self.connection
-            .enqueue(proto::Request::Create {
+            .enqueue(Request::Create {
                 path: path.to_string(),
-                data: data,
+                data,
                 acl: acl.into(),
                 mode,
             })
@@ -462,7 +446,7 @@ impl ZooKeeper {
         trace!(self.logger, "set_data"; "path" => path, "version" => ?version, "dlen" => data.len());
         let version = version.unwrap_or(-1);
         self.connection
-            .enqueue(proto::Request::SetData {
+            .enqueue(Request::SetData {
                 path: path.to_string(),
                 version,
                 data,
@@ -487,9 +471,9 @@ impl ZooKeeper {
         trace!(self.logger, "delete"; "path" => path, "version" => ?version);
         let version = version.unwrap_or(-1);
         self.connection
-            .enqueue(proto::Request::Delete {
+            .enqueue(Request::Delete {
                 path: path.to_string(),
-                version: version,
+                version,
             })
             .and_then(move |r| transform::delete(version, r))
             .map(move |r| (self, r))
@@ -507,7 +491,7 @@ impl ZooKeeper {
     {
         trace!(self.logger, "get_acl"; "path" => path);
         self.connection
-            .enqueue(proto::Request::GetAcl {
+            .enqueue(Request::GetAcl {
                 path: path.to_string(),
             })
             .and_then(transform::get_acl)
@@ -535,7 +519,7 @@ impl ZooKeeper {
         trace!(self.logger, "set_acl"; "path" => path, "version" => ?version);
         let version = version.unwrap_or(-1);
         self.connection
-            .enqueue(proto::Request::SetAcl {
+            .enqueue(Request::SetAcl {
                 path: path.to_string(),
                 acl: acl.into(),
                 version,
@@ -564,7 +548,7 @@ impl ZooKeeper {
     ) -> impl Future<Item = (Self, Option<Stat>), Error = failure::Error> {
         trace!(self.logger, "exists"; "path" => path, "watch" => ?watch);
         self.connection
-            .enqueue(proto::Request::Exists {
+            .enqueue(Request::Exists {
                 path: path.to_string(),
                 watch,
             })
@@ -587,7 +571,7 @@ impl ZooKeeper {
     ) -> impl Future<Item = (Self, Option<Vec<String>>), Error = failure::Error> {
         trace!(self.logger, "get_children"; "path" => path, "watch" => ?watch);
         self.connection
-            .enqueue(proto::Request::GetChildren {
+            .enqueue(Request::GetChildren {
                 path: path.to_string(),
                 watch,
             })
@@ -614,7 +598,7 @@ impl ZooKeeper {
     ) -> impl Future<Item = (Self, Option<(Vec<u8>, Stat)>), Error = failure::Error> {
         trace!(self.logger, "get_data"; "path" => path, "watch" => ?watch);
         self.connection
-            .enqueue(proto::Request::GetData {
+            .enqueue(Request::GetData {
                 path: path.to_string(),
                 watch,
             })
@@ -770,7 +754,7 @@ impl WithWatcher {
 #[derive(Debug)]
 pub struct MultiBuilder {
     zk: ZooKeeper,
-    requests: Vec<proto::Request>,
+    requests: Vec<Request>,
 }
 
 impl MultiBuilder {
@@ -782,11 +766,11 @@ impl MultiBuilder {
         D: Into<Cow<'static, [u8]>>,
         A: Into<Cow<'static, [Acl]>>,
     {
-        self.requests.push(proto::Request::Create {
+        self.requests.push(Request::Create {
             path: path.to_string(),
             data: data.into(),
             acl: acl.into(),
-            mode: mode,
+            mode,
         });
         self
     }
@@ -798,7 +782,7 @@ impl MultiBuilder {
     where
         D: Into<Cow<'static, [u8]>>,
     {
-        self.requests.push(proto::Request::SetData {
+        self.requests.push(Request::SetData {
             path: path.to_string(),
             version: version.unwrap_or(-1),
             data: data.into(),
@@ -810,7 +794,7 @@ impl MultiBuilder {
     ///
     /// See [`ZooKeeper::delete`] for details.
     pub fn delete(mut self, path: &str, version: Option<i32>) -> Self {
-        self.requests.push(proto::Request::Delete {
+        self.requests.push(Request::Delete {
             path: path.to_string(),
             version: version.unwrap_or(-1),
         });
@@ -822,7 +806,7 @@ impl MultiBuilder {
     /// There is no equivalent to the check operation outside of a multi
     /// request.
     pub fn check(mut self, path: &str, version: i32) -> Self {
-        self.requests.push(proto::Request::Check {
+        self.requests.push(Request::Check {
             path: path.to_string(),
             version,
         });
@@ -837,9 +821,9 @@ impl MultiBuilder {
         let (zk, requests) = (self.zk, self.requests);
         let reqs_lite: Vec<transform::RequestMarker> = requests.iter().map(|r| r.into()).collect();
         zk.connection
-            .enqueue(proto::Request::Multi(requests))
+            .enqueue(Request::Multi(requests))
             .and_then(move |r| match r {
-                Ok(proto::Response::Multi(responses)) => reqs_lite
+                Ok(Response::Multi(responses)) => reqs_lite
                     .iter()
                     .zip(responses)
                     .map(|(req, res)| transform::multi(req, res))
@@ -856,6 +840,7 @@ mod tests {
     use super::*;
 
     use slog::Drain;
+    use types::watch::{KeeperState, WatchedEventType};
 
     #[test]
     fn it_works() {
@@ -866,8 +851,8 @@ mod tests {
         let drain = slog_async::Async::new(drain).build().fuse();
         builder.set_logger(slog::Logger::root(drain, o!()));
 
-        let (zk, w): (ZooKeeper, _) =
-            rt.block_on(
+        let (zk, w): (ZooKeeper, _) = rt
+            .block_on(
                 builder
                     .connect(&"127.0.0.1:2181".parse().unwrap())
                     .and_then(|(zk, w)| {
@@ -886,7 +871,8 @@ mod tests {
                                     &b"Hello world"[..],
                                     Acl::open_unsafe(),
                                     CreateMode::Persistent,
-                                ).map(move |(zk, x)| (zk, x, exists_w))
+                                )
+                                .map(move |(zk, x)| (zk, x, exists_w))
                             })
                             .inspect(|(_, ref path, _)| {
                                 assert_eq!(path.as_ref().map(String::as_str), Ok("/foo"))
@@ -1015,7 +1001,8 @@ mod tests {
                             })
                             .map(|(zk, (_, w))| (zk, w))
                     }),
-            ).unwrap();
+            )
+            .unwrap();
 
         drop(zk); // make Packetizer idle
         rt.shutdown_on_idle().wait().unwrap();
@@ -1142,8 +1129,8 @@ mod tests {
         let drain = slog_async::Async::new(drain).build().fuse();
         builder.set_logger(slog::Logger::root(drain, o!()));
 
-        let (zk, _): (ZooKeeper, _) =
-            rt.block_on(
+        let (zk, _): (ZooKeeper, _) = rt
+            .block_on(
                 builder
                     .connect(&"127.0.0.1:2181".parse().unwrap())
                     .and_then(|(zk, _)| {
@@ -1152,44 +1139,46 @@ mod tests {
                             &b"foo"[..],
                             Acl::open_unsafe(),
                             CreateMode::Ephemeral,
-                        ).and_then(|(zk, _)| zk.get_acl("/acl_test"))
-                            .inspect(|(_, res)| {
-                                let res = res.as_ref().unwrap();
-                                assert_eq!(res.0, Acl::open_unsafe())
-                            })
-                            .and_then(|(zk, res)| {
-                                zk.set_acl(
-                                    "/acl_test",
-                                    Acl::creator_all(),
-                                    Some(res.unwrap().1.version),
-                                )
-                            })
-                            .inspect(|(_, res)| {
-                                // a not authenticated user is not able to set `auth` scheme acls.
-                                assert_eq!(res, &Err(error::SetAcl::InvalidAcl))
-                            })
-                            .and_then(|(zk, _)| zk.set_acl("/acl_test", Acl::read_unsafe(), None))
-                            .inspect(|(_, stat)| {
-                                // successfully change node acl to `read_unsafe`
-                                assert_eq!(stat.unwrap().data_length as usize, b"foo".len())
-                            })
-                            .and_then(|(zk, _)| zk.get_acl("/acl_test"))
-                            .inspect(|(_, res)| {
-                                let res = res.as_ref().unwrap();
-                                assert_eq!(res.0, Acl::read_unsafe())
-                            })
-                            .and_then(|(zk, _)| zk.set_data("/acl_test", None, &b"bar"[..]))
-                            .inspect(|(_, res)| {
-                                // cannot set data on a read only node
-                                assert_eq!(res, &Err(error::SetData::NoAuth))
-                            })
-                            .and_then(|(zk, _)| zk.set_acl("/acl_test", Acl::open_unsafe(), None))
-                            .inspect(|(_, res)| {
-                                // cannot change a read only node's acl
-                                assert_eq!(res, &Err(error::SetAcl::NoAuth))
-                            })
+                        )
+                        .and_then(|(zk, _)| zk.get_acl("/acl_test"))
+                        .inspect(|(_, res)| {
+                            let res = res.as_ref().unwrap();
+                            assert_eq!(res.0, Acl::open_unsafe())
+                        })
+                        .and_then(|(zk, res)| {
+                            zk.set_acl(
+                                "/acl_test",
+                                Acl::creator_all(),
+                                Some(res.unwrap().1.version),
+                            )
+                        })
+                        .inspect(|(_, res)| {
+                            // a not authenticated user is not able to set `auth` scheme acls.
+                            assert_eq!(res, &Err(error::SetAcl::InvalidAcl))
+                        })
+                        .and_then(|(zk, _)| zk.set_acl("/acl_test", Acl::read_unsafe(), None))
+                        .inspect(|(_, stat)| {
+                            // successfully change node acl to `read_unsafe`
+                            assert_eq!(stat.unwrap().data_length as usize, b"foo".len())
+                        })
+                        .and_then(|(zk, _)| zk.get_acl("/acl_test"))
+                        .inspect(|(_, res)| {
+                            let res = res.as_ref().unwrap();
+                            assert_eq!(res.0, Acl::read_unsafe())
+                        })
+                        .and_then(|(zk, _)| zk.set_data("/acl_test", None, &b"bar"[..]))
+                        .inspect(|(_, res)| {
+                            // cannot set data on a read only node
+                            assert_eq!(res, &Err(error::SetData::NoAuth))
+                        })
+                        .and_then(|(zk, _)| zk.set_acl("/acl_test", Acl::open_unsafe(), None))
+                        .inspect(|(_, res)| {
+                            // cannot change a read only node's acl
+                            assert_eq!(res, &Err(error::SetAcl::NoAuth))
+                        })
                     }),
-            ).unwrap();
+            )
+            .unwrap();
 
         drop(zk); // make Packetizer idle
         rt.shutdown_on_idle().wait().unwrap();

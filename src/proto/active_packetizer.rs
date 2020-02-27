@@ -1,13 +1,18 @@
-use super::{request, watch::WatchType, Request, Response};
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use failure;
+use failure::bail;
 use futures::sync::{mpsc, oneshot};
+use futures::try_ready;
 use slog;
+use slog::{debug, info, trace};
 use std::collections::HashMap;
 use std::{mem, time};
 use tokio;
 use tokio::prelude::*;
-use {WatchedEvent, WatchedEventType, ZkError};
+
+use super::{request, Request, Response};
+use crate::error::ZkError;
+use crate::types::watch::{WatchType, WatchedEvent, WatchedEventType};
 
 pub(super) struct ActivePacketizer<S> {
     stream: S,
@@ -191,7 +196,8 @@ where
                         }
 
                         if self.inlen() >= 4 && need == 4 {
-                            let length = (&mut &self.inbox[self.instart..]).read_i32::<BigEndian>()?
+                            let length = (&mut &self.inbox[self.instart..])
+                                .read_i32::<BigEndian>()?
                                 as usize;
                             need += length;
                         }
@@ -300,7 +306,7 @@ where
                     // find the waiting request future
                     let (opcode, tx) = match self.reply.remove(&xid) {
                         Some(tuple) => tuple,
-                        None => bail!("No waiting request future found for xid {:?}", xid)
+                        None => bail!("No waiting request future found for xid {:?}", xid),
                     };
 
                     if let Some(w) = self.pending_watchers.remove(&xid) {

@@ -1,10 +1,10 @@
-mod acl;
+pub mod acl;
 pub use self::acl::*;
 
-mod watch;
+pub mod watch;
 pub use self::watch::*;
 
-mod multi;
+pub mod multi;
 pub use self::multi::*;
 
 /// Statistics about a znode, similar to the UNIX `stat` structure.

@@ -1,6 +1,7 @@
 use std::fmt;
 use std::ops;
 
+use lazy_static::lazy_static;
 use std::string::ToString;
 
 /// Describes the ability of a user to perform a certain action.
@@ -36,7 +37,7 @@ impl Permission {
         Permission(bits)
     }
 
-    pub(crate) fn code(&self) -> u32 {
+    pub(crate) fn code(self) -> u32 {
         self.0
     }
 
