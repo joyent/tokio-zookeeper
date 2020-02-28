@@ -1,25 +1,30 @@
-use super::{
-    active_packetizer::ActivePacketizer, request, watch::WatchType, Request, Response,
-    ZooKeeperTransport,
-};
 use byteorder::{BigEndian, WriteBytesExt};
 use failure;
+use failure::format_err;
+
 use futures::{
     future::Either,
     sync::{mpsc, oneshot},
+    try_ready,
 };
 use slog;
+use slog::{debug, error, trace};
 use std::mem;
 use tokio;
 use tokio::prelude::*;
-use {Watch, WatchedEvent, ZkError};
+
+use super::{request, Request, Response, ZooKeeperTransport};
+use crate::error::ZkError;
+use crate::proto::active_packetizer::ActivePacketizer;
+use crate::types::watch::{WatchType, WatchedEvent};
+use crate::Watch;
 
 pub(crate) struct Packetizer<S>
 where
     S: ZooKeeperTransport,
 {
     /// ZooKeeper address
-    addr: S::Addr,
+    _addr: S::Addr,
 
     /// Current state
     state: PacketizerState<S>,
@@ -43,7 +48,7 @@ where
     S: ZooKeeperTransport,
 {
     pub(crate) fn new(
-        addr: S::Addr,
+        _addr: S::Addr,
         stream: S,
         log: slog::Logger,
         default_watcher: mpsc::UnboundedSender<WatchedEvent>,
@@ -56,14 +61,15 @@ where
         let exitlogger = log.clone();
         tokio::spawn(
             Packetizer {
-                addr,
+                _addr,
                 state: PacketizerState::Connected(ActivePacketizer::new(stream)),
                 xid: 0,
                 default_watcher,
-                rx: rx,
+                rx,
                 logger: log,
                 exiting: false,
-            }.map_err(move |e| {
+            }
+            .map_err(move |e| {
                 error!(exitlogger, "packetizer exiting: {:?}", e);
                 drop(e);
             }),
@@ -73,6 +79,7 @@ where
     }
 }
 
+#[allow(dead_code)]
 enum PacketizerState<S> {
     Connected(ActivePacketizer<S>),
     Reconnecting(Box<Future<Item = ActivePacketizer<S>, Error = failure::Error> + Send + 'static>),
@@ -90,7 +97,7 @@ where
     ) -> Result<Async<()>, failure::Error> {
         let ap = match *self {
             PacketizerState::Connected(ref mut ap) => {
-                return ap.poll(exiting, logger, default_watcher)
+                return ap.poll(exiting, logger, default_watcher);
             }
             PacketizerState::Reconnecting(ref mut c) => try_ready!(c.poll()),
         };
@@ -201,7 +208,8 @@ where
             }
         }
 
-        self.state.poll(self.exiting, &mut self.logger, &mut self.default_watcher)
+        self.state
+            .poll(self.exiting, &mut self.logger, &mut self.default_watcher)
     }
 }
 
@@ -217,9 +225,7 @@ impl Enqueuer {
     ) -> impl Future<Item = Result<Response, ZkError>, Error = failure::Error> {
         let (tx, rx) = oneshot::channel();
         match self.0.unbounded_send((request, tx)) {
-            Ok(()) => {
-                Either::A(rx.map_err(|e| format_err!("Error processing request: {:?}", e)))
-            }
+            Ok(()) => Either::A(rx.map_err(|e| format_err!("Error processing request: {:?}", e))),
             Err(e) => {
                 Either::B(Err(format_err!("failed to enqueue new request: {:?}", e)).into_future())
             }
