@@ -1,4 +1,23 @@
 use failure_derive::Fail;
+use std::io::Error as IoError;
+
+///
+/// Represents errors handled internally by the client, as opposed to being
+/// returned to the user
+///
+#[derive(Debug)]
+pub enum InternalError {
+    ///
+    /// A server error to be handled internally.
+    ///
+    ServerError(ZkError),
+    ///
+    /// A generic error to be handled internally.
+    /// TODO do we need this?
+    ///
+    DanglingXid(i32),
+    MalformedResponse(IoError),
+}
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
 #[repr(i32)]

@@ -21,7 +21,6 @@ use tokio::prelude::*;
 
 use super::{request, Request, Response, ZooKeeperTransport};
 use crate::error::ZkError;
-use crate::proto::active_packetizer::ActivePacketizer;
 use crate::proto::session_manager::SessionManager;
 use crate::types::watch::{WatchType, WatchedEvent};
 use crate::Watch;
@@ -36,9 +35,7 @@ pub(crate) struct Packetizer {
     logger: slog::Logger,
 
     exiting: bool,
-    sess_mgr: Arc<Mutex<SessionManager>>, // /// Current state
-    // state: PacketizerState<S>
-    active_packetizer: ActivePacketizer,
+    sess_mgr: Arc<Mutex<SessionManager>>,
 }
 
 // TODO use tokio_util::codec for packetization
@@ -72,7 +69,6 @@ impl Packetizer {
                 logger: log,
                 exiting: false,
                 sess_mgr: Arc::new(Mutex::new(SessionManager::new(addr))),
-                active_packetizer: ActivePacketizer::new(),
             };
             p.run()
             // .map_err(move |e| {
@@ -101,11 +97,11 @@ impl Packetizer {
     }
 }
 
-#[allow(dead_code)]
-enum PacketizerState {
-    Connected(ActivePacketizer),
-    Reconnecting(Box<Future<Output = Result<ActivePacketizer, failure::Error>> + Send + 'static>),
-}
+// #[allow(dead_code)]
+// enum PacketizerState {
+//     Connected(ActivePacketizer),
+//     Reconnecting(Box<Future<Output = Result<ActivePacketizer, failure::Error>> + Send + 'static>),
+// }
 
 // impl<S> PacketizerState<S>
 // where

@@ -1,17 +1,18 @@
 use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
-use bytes::BytesMut;
+use bytes::{Buf, BytesMut};
+use futures::channel::mpsc::UnboundedSender;
 use futures::channel::oneshot::Sender;
-use slog::{debug, info, trace, Logger};
+use slog::{debug, error, info, trace, Logger};
 use std::collections::HashMap;
 use std::io::Error as IoError;
 use std::sync::{Arc, Mutex};
 use tokio_util::codec::Decoder;
 
-use crate::error::ZkError;
+use crate::error::{InternalError, ZkError};
 use crate::proto::request::{self, OpCode, Request};
 use crate::proto::response::{ReadFrom, Response};
 use crate::proto::session_manager::ReconnectInfo;
-use crate::types::watch::{WatchType, WatchedEvent};
+use crate::types::watch::{WatchType, WatchedEvent, WatchedEventType};
 
 const HEADER_SIZE: usize = 4;
 
@@ -44,6 +45,10 @@ struct ZkDecoder {
     ///
     pending_watches: Arc<Mutex<HashMap<i32, (String, Sender<WatchedEvent>, WatchType)>>>,
     ///
+    /// Sending end of default watch stream
+    ///
+    default_watcher: UnboundedSender<WatchedEvent>,
+    ///
     /// `true` if the decoder hasn't decoded a message yet; false otherwise
     ///
     first: bool,
@@ -59,44 +64,55 @@ impl ZkDecoder {
         replies: Arc<Mutex<HashMap<i32, (OpCode, Sender<Result<Response, ZkError>>)>>>,
         watches: Arc<Mutex<HashMap<String, Vec<(Sender<WatchedEvent>, WatchType)>>>>,
         pending_watches: Arc<Mutex<HashMap<i32, (String, Sender<WatchedEvent>, WatchType)>>>,
+        default_watcher: UnboundedSender<WatchedEvent>,
+        reconnect_info: Arc<Mutex<ReconnectInfo>>,
         log: Logger,
     ) -> Self {
         ZkDecoder {
             replies,
             watches,
             pending_watches,
+            default_watcher,
             // TODO make sure "first" gets set and reset appropriately
             first: true,
+            reconnect_info,
             log,
         }
     }
 
-    fn handle_new_zxid(zxid: i64) {
+    fn handle_new_zxid(&self, zxid: i64) {
         if zxid > 0 {
             let mut reconnect_info = self.reconnect_info.lock().unwrap();
             trace!(
-                log,
+                self.log,
                 "updated zxid from {} to {}",
                 reconnect_info.last_zxid_seen,
                 zxid
             );
 
-            assert!(zxid >= self.last_zxid_seen);
+            assert!(zxid >= reconnect_info.last_zxid_seen);
             reconnect_info.last_zxid_seen = zxid;
         }
     }
 }
 
 impl Decoder for ZkDecoder {
-    type Item = Response;
+    type Item = Result<(), InternalError>;
+    // This is for unrecoverable errors. We don't actually return this.
+    // TODO change the type to () or something?
     type Error = IoError;
 
+    // TODO refactor this big boy function
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
+        fn wrap<T, E>(item: T) -> Result<Option<T>, E> {
+            Ok(Some(item))
+        }
+
         //
         // We can read from the slice and take advantage of its cursor-tracking
         // without modifying the actual BytesMut buffer
         //
-        let mut buf = &src[0..HEADER_SIZE];
+        let mut buf = &src[0..src.len()];
 
         // See if we've received the message length yet
         if buf.len() < HEADER_SIZE {
@@ -123,6 +139,7 @@ impl Decoder for ZkDecoder {
         // received, the xid we've stored it with will be 0.
         //
         let xid = if self.first {
+            self.first = false;
             0
         } else {
             // Deserialize xid and zxid
@@ -146,7 +163,8 @@ impl Decoder for ZkDecoder {
         if xid == 0 && !self.first {
             trace!(self.log, "got response to CloseSession");
             if let Some(e) = err {
-                bail!("failed to close session: {:?}", e);
+                src.advance(msg_len + HEADER_SIZE);
+                return wrap(Err(InternalError::ServerError(e)));
             }
         //
         // A watch has triggered.
@@ -156,20 +174,28 @@ impl Decoder for ZkDecoder {
             let e = WatchedEvent::read_from(&mut buf)?;
             trace!(self.log, "got watch event {:?}", e);
 
-            let mut remove = false;
+            let mut watches = self.watches.lock().unwrap();
+            let mut remove_watch_list = false;
+            let mut global_watch = false;
 
             // Check for any custom watches set by the user and notify them
-            if let Some(watches) = self.watches.get_mut(&e.path) {
+            if let Some(watch_list) = watches.get_mut(&e.path) {
                 trace!(self.log,
                        "found potentially waiting custom watchers";
-                       "n" => watches.len()
+                       "n" => watch_list.len()
                 );
 
                 //
+                // Iterate throught the watches and find any that the event
+                // matches. If we find a match, remove the watch from the Vec.
                 //
-                let mut i = (watches.len() - 1) as isize;
-                while i >= 0 {
-                    let watch_matched = match (&watches[i as usize].1, e.event_type) {
+                // We iterate in reverse so we can safely use swap_remove() for
+                // removal from the Vec, knowing that we've already iterated
+                // over the last element in the Vec. This is pretty optimize-y.
+                // Is it worth doing? (TODO)
+                //
+                for i in (0..watch_list.len()).rev() {
+                    let watch_matched = match (watch_list[i].1, e.event_type) {
                         (WatchType::Child, WatchedEventType::NodeDeleted)
                         | (WatchType::Child, WatchedEventType::NodeChildrenChanged) => true,
                         (WatchType::Child, _) => false,
@@ -181,102 +207,140 @@ impl Decoder for ZkDecoder {
                     };
 
                     if watch_matched {
-                        // this watcher is no longer active
-                        let w = watchers.swap_remove(i as usize);
-                        // NOTE: ignore the case where the receiver has been dropped
+                        let w = watch_list.swap_remove(i);
+                        //
+                        // We send without worrying about the result, because
+                        // the user may have dropped the receiver, and that's
+                        // ok.
+                        //
                         let _ = w.0.send(e.clone());
                     }
-                    i -= 1;
                 }
-
-                if watchers.is_empty() {
-                    remove = true;
+                if watch_list.is_empty() {
+                    remove_watch_list = true;
                 }
+            } else {
+                global_watch = true;
             }
 
-            if remove {
-                self.watchers
-                    .remove(&e.path)
-                    .expect("tried to remove watcher that didn't exist");
+            if remove_watch_list {
+                watches.remove(&e.path).expect(
+                    "tried to remove a watch list for a path with no \
+                     registered watches",
+                );
             }
 
-            // NOTE: ignoring error, because the user may not care about events
-            let _ = default_watcher.unbounded_send(e);
+            if global_watch {
+                //
+                // TODO as far as I can tell, the original client send watch
+                // events over the default watcher _even if_ there was a custom
+                // watcher sent. Do we want to do this? Probably not.
+                //
+                // We ignore any send errors, because the user may have dropped
+                // the default watcher, and that's ok.
+                //
+                let _ = self.default_watcher.unbounded_send(e);
+            }
+        //
+        // TODO remove magic numbers like -2 here
+        // Response to ping. The response is empty beyond the xid/zxid/err.
+        //
         } else if xid == -2 {
-            // response to ping -- empty response
-            trace!(logger, "got response to heartbeat");
+            trace!(self.log, "got response to heartbeat");
             if let Some(e) = err {
-                bail!("bad response to ping: {:?}", e);
+                src.advance(msg_len + HEADER_SIZE);
+                return wrap(Err(InternalError::ServerError(e)));
             }
+        //
+        // Response to user request
+        //
         } else {
-            // response to user request
-            self.first = false;
+            // TODO is it ok that I moved this to the if statement above?
+            // self.first = false;
 
-            // find the waiting request future
-            let (opcode, tx) = match self.reply.remove(&xid) {
+            // Find the waiting request
+            let (opcode, tx) = match self.replies.lock().unwrap().remove(&xid) {
                 Some(tuple) => tuple,
-                None => bail!("No waiting request future found for xid {:?}", xid),
+                None => {
+                    // TODO what to do here? Should this ever happen?
+                    src.advance(msg_len + HEADER_SIZE);
+                    return wrap(Err(InternalError::DanglingXid(xid)));
+                }
             };
 
-            if let Some(w) = self.pending_watchers.remove(&xid) {
-                // normally, watches are *only* added for successful operations
-                // the exception to this is if an exists call fails with NoNode
+            //
+            // If the request tried to set a watch, we confirm that the request
+            // has succeeded and register the watch if so.
+            //
+            if let Some(w) = self.pending_watches.lock().unwrap().remove(&xid) {
+                //
+                // Normally, a requested watch is only added once the initial
+                // operation is successful. The one exception to this is if an
+                // exists call fails with NoNode.
+                //
                 if err.is_none()
                     || (opcode == request::OpCode::Exists && err == Some(ZkError::NoNode))
                 {
-                    trace!(logger, "pending watcher turned into real watcher"; "xid" => xid);
-                    self.watchers
+                    debug!(self.log, "pending watch turned into real watch"; "xid" => xid);
+                    self.watches
+                        .lock()
+                        .unwrap()
                         .entry(w.0)
                         .or_insert_with(Vec::new)
                         .push((w.1, w.2));
                 } else {
-                    trace!(logger,
-                           "pending watcher not turned into real watcher: {:?}",
+                    debug!(self.log,
+                           "pending watch not turned into real watch: {:?}",
                            err;
                            "xid" => xid
                     );
                 }
             }
 
+            //
+            // We send the ZkError or successful response data to the user.
+            //
             if let Some(e) = err {
-                info!(logger,
+                info!(self.log,
                        "handling server error response: {:?}", e;
                        "xid" => xid, "opcode" => ?opcode);
-
-                tx.send(Err(e)).is_ok();
+                tx.send(Err(e)).expect("Internal rx for response dropped");
             } else {
-                let mut r = Response::parse(opcode, &mut buf)?;
+                match Response::parse(opcode, &mut buf) {
+                    Ok(mut r) => {
+                        debug!(self.log,
+                               "handling server response: {:?}", r;
+                               "xid" => xid, "opcode" => ?opcode);
+                        if let Response::Connect {
+                            timeout,
+                            session_id,
+                            ref mut password,
+                            ..
+                        } = r
+                        {
+                            // TODO handle session mgr stuff
+                            // assert!(timeout >= 0);
+                            // trace!(logger, "negotiated session timeout: {}ms", timeout);
 
-                debug!(logger,
-                       "handling server response: {:?}", r;
-                       "xid" => xid, "opcode" => ?opcode);
+                            // self.timeout = time::Duration::from_millis(2 * timeout as u64 / 3);
+                            // self.timer.reset(time::Instant::now() + self.timeout);
 
-                if let Response::Connect {
-                    timeout,
-                    session_id,
-                    ref mut password,
-                    ..
-                } = r
-                {
-                    assert!(timeout >= 0);
-                    trace!(logger, "negotiated session timeout: {}ms", timeout);
-
-                    self.timeout = time::Duration::from_millis(2 * timeout as u64 / 3);
-                    self.timer.reset(time::Instant::now() + self.timeout);
-
-                    // keep track of these for consistent re-connect
-                    self.session_id = session_id;
-                    mem::swap(&mut self.password, password);
+                            // // keep track of these for consistent re-connect
+                            // self.session_id = session_id;
+                            // mem::swap(&mut self.password, password);
+                        }
+                        tx.send(Ok(r)).expect("Internal rx for response dropped");
+                    }
+                    Err(e) => {
+                        src.advance(msg_len + HEADER_SIZE);
+                        // TODO impl From<IoError> for InternalError instead?
+                        return wrap(Err(InternalError::MalformedResponse(e)));
+                    }
                 }
-
-                tx.send(Ok(r)).is_ok(); // if receiver doesn't care, we don't either
             }
         }
-
-        if self.instart == self.inbox.len() {
-            self.inbox.clear();
-            self.instart = 0;
-        }
+        src.advance(msg_len + HEADER_SIZE);
+        wrap(Ok(()))
 
         // TODO some activepacketizer logic ends up here; some ends up in other places --
         // make sure we've accounted for all of it!
@@ -286,10 +350,10 @@ impl Decoder for ZkDecoder {
         // TODO remember, later, that when we search for the waiting future for a connect response in the
         // reply map, it will have an artificial xid of 0
 
-        // TODO make sure to check later that the response type matches the
-        // expected opcode from the map
-        Ok(None)
-
         // TODO add logging everywhere; uncomment existing log lines
+
+        // TODO implement decode_eof?
+
+        // TODO write a comment explaining all the various nested errors and control flow here
     }
 }
