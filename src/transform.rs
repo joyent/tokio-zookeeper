@@ -1,3 +1,7 @@
+//
+// Copyright 2020 Joyent, Inc.
+//
+
 use failure::{bail, format_err};
 
 use crate::error;
