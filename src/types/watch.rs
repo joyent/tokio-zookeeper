@@ -1,10 +1,11 @@
-use futures::sync::oneshot::Sender;
+use futures::channel::mpsc::Sender as MpscSender;
+use futures::channel::oneshot::Sender as OneshotSender;
 
 #[derive(Debug)]
 pub(crate) enum Watch {
     None,
-    Global,
-    Custom(Sender<WatchedEvent>),
+    Stream(MpscSender<WatchedEvent>),
+    Oneshot(OneshotSender<WatchedEvent>),
 }
 
 impl Watch {
