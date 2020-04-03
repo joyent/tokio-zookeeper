@@ -5,8 +5,8 @@ use std::net::SocketAddr;
 use tokio;
 use tokio::prelude::*;
 
-pub(crate) mod active_packetizer;
 pub(crate) mod decoder;
+pub(crate) mod encoder;
 pub(crate) mod packetizer;
 pub(crate) mod request;
 pub(crate) mod response;

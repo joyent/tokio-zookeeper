@@ -226,8 +226,8 @@ pub mod transform;
 pub mod types;
 
 use failure::{bail, format_err};
-use futures::channel::mpsc::Sender as MpscSender;
-use futures::channel::oneshot::{self, Receiver as OneshotReceiver};
+use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use futures::channel::oneshot::{self, Receiver};
 use futures::{Future, FutureExt, Stream, TryFutureExt};
 use slog::{debug, o, trace};
 use std::borrow::Cow;
@@ -235,7 +235,7 @@ use std::net::SocketAddr;
 use std::time;
 use tokio::net::TcpStream;
 
-use proto::packetizer::{Enqueuer, Packetizer};
+use proto::packetizer::{Enqueuer, SharedState};
 use proto::request::Request;
 use proto::response::Response;
 use types::watch::Watch;
@@ -289,7 +289,7 @@ impl Default for ZooKeeperBuilder {
 
         ZooKeeperBuilder {
             // TODO make this a constant
-            session_timeout: time::Duration::new(0, 0),
+            session_timeout: time::Duration::from_secs(86_400),
             logger: root,
         }
     }
@@ -308,28 +308,27 @@ impl ZooKeeperBuilder {
     /// Only if re-connection fails is an error returned to the client. Requests that are in-flight
     /// during a disconnect may fail and have to be retried.
     ///
-    pub async fn connect(self, addr: &SocketAddr) -> Result<ZooKeeper, failure::Error> {
+    pub async fn connect(
+        self,
+        addr: &SocketAddr,
+    ) -> Result<(ZooKeeper, UnboundedReceiver<WatchedEvent>), failure::Error> {
         let addr = *addr;
-        let request = Request::Connect {
-            protocol_version: 0,
-            last_zxid_seen: 0,
-            timeout: (self.session_timeout.as_secs() * 1_000) as i32
-                + self.session_timeout.subsec_millis() as i32,
-            session_id: 0,
-            passwd: vec![],
-            read_only: false,
-        };
+        // TODO make sure the logic works out so the session manager doesn't enqueue its
+        // own connect request when it starts up, leading to two connect requests
+        // TODO plumb session timeout through from user to inner workings
+        // TODO allow user to specify read-only?
         debug!(self.logger, "enqueueing connect request");
         let plog = self.logger.clone();
-        let enqueuer = Packetizer::start(addr, plog);
-        enqueuer.enqueue(request).await.map(move |response| {
-            // TODO return an error here if the response is a failure
-            trace!(self.logger, "{:?}", response);
+        let (tx, rx) = mpsc::unbounded();
+        let enqueuer = SharedState::start(addr, tx, plog).await;
+        Ok((
             ZooKeeper {
                 connection: enqueuer,
                 logger: self.logger,
-            }
-        })
+            },
+            rx,
+        ))
+        // TODO should this function ever return an error?
     }
 
     /// Set the ZooKeeper [session expiry
@@ -355,7 +354,9 @@ impl ZooKeeper {
     ///
     /// See [`ZooKeeperBuilder::connect`].
     ///
-    pub async fn connect(addr: &SocketAddr) -> Result<Self, failure::Error> {
+    pub async fn connect(
+        addr: &SocketAddr,
+    ) -> Result<(Self, UnboundedReceiver<WatchedEvent>), failure::Error> {
         ZooKeeperBuilder::default().connect(addr).await
     }
 
@@ -559,29 +560,28 @@ impl ZooKeeper {
     pub async fn exists_watch_oneshot(
         &self,
         path: &str,
-    ) -> Result<(Option<Stat>, OneshotReceiver<WatchedEvent>), failure::Error> {
+    ) -> Result<(Option<Stat>, Receiver<WatchedEvent>), failure::Error> {
         let (tx, rx) = oneshot::channel();
         self.exists_inner(path, Watch::Oneshot(tx))
             .await
             .map(|res| (res, rx))
     }
 
-    ///
-    /// Return the [`Stat`] of the node of the given `path`, or `None` if the
-    /// node does not exist.
-    ///
-    /// If no errors occur, a watch will be left on the node at the given
-    /// `path`. The watch is triggered by any successful operation that creates
-    /// or deletes the node, or sets the data on the node, and in turn causes an
-    /// event to be sent over the provided `mpsc::Sender`.
-    ///
-    pub async fn exists_watch_stream(
-        &self,
-        path: &str,
-        tx: MpscSender<WatchedEvent>,
-    ) -> Result<Option<Stat>, failure::Error> {
-        self.exists_inner(path, Watch::Stream(tx)).await
-    }
+    // ///
+    // /// Return the [`Stat`] of the node of the given `path`, or `None` if the
+    // /// node does not exist.
+    // ///
+    // /// If no errors occur, a watch will be left on the node at the given
+    // /// `path`. The watch is triggered by any successful operation that creates
+    // /// or deletes the node, or sets the data on the node, and in turn causes an
+    // /// event to be sent over the provided `mpsc::Sender`.
+    // ///
+    // pub async fn exists_watch_stream(
+    //     &self,
+    //     path: &str,
+    //     tx: MpscSender<WatchedEvent>,
+    // ) -> Result<Option<St     self.exists_inner(path, Watch::Stream(tx)).await
+    // }
 
     async fn get_children_inner(
         &self,
@@ -624,32 +624,32 @@ impl ZooKeeper {
     pub async fn get_children_watch_oneshot(
         &self,
         path: &str,
-    ) -> Result<(Option<Vec<String>>, OneshotReceiver<WatchedEvent>), failure::Error> {
+    ) -> Result<(Option<Vec<String>>, Receiver<WatchedEvent>), failure::Error> {
         let (tx, rx) = oneshot::channel();
         self.get_children_inner(path, Watch::Oneshot(tx))
             .await
             .map(|res| (res, rx))
     }
 
-    ///
-    /// Return the names of the children of the node at the given `path`, or
-    /// `None` if the node does not exist.
-    ///
-    /// The returned list of children is not sorted and no guarantee is provided
-    /// as to its natural or lexical order.
-    ///
-    /// If no errors occur, a watch is left on the node at the given `path`. The
-    /// watch is triggered by any successful operation that deletes the node at
-    /// the given `path`, or creates or deletes a child of that node, and in
-    /// turn causes an event to be sent over the provided `mpsc::Sender`.
-    ///
-    pub async fn get_children_watch_stream(
-        &self,
-        path: &str,
-        tx: MpscSender<WatchedEvent>,
-    ) -> Result<Option<Vec<String>>, failure::Error> {
-        self.get_children_inner(path, Watch::Stream(tx)).await
-    }
+    // ///
+    // /// Return the names of the children of the node at the given `path`, or
+    // /// `None` if the node does not exist.
+    // ///
+    // /// The returned list of children is not sorted and no guarantee is provided
+    // /// as to its natural or lexical order.
+    // ///
+    // /// If no errors occur, a watch is left on the node at the given `path`. The
+    // /// watch is triggered by any successful operation that deletes the node at
+    // /// the given `path`, or creates or deletes a child of that node, and in
+    // /// turn causes an event to be sent over the provided `mpsc::Sender`.
+    // ///
+    // pub async fn get_children_watch_stream(
+    //     &self,
+    //     path: &str,
+    //     tx: MpscSender<WatchedEvent>,
+    // ) -> Result<Option< {
+    //     self.get_children_inner(path, Watch::Stream(tx)).await
+    // }
 
     async fn get_data_inner(
         &self,
@@ -686,29 +686,29 @@ impl ZooKeeper {
     pub async fn get_data_watch_oneshot(
         &self,
         path: &str,
-    ) -> Result<(Option<(Vec<u8>, Stat)>, OneshotReceiver<WatchedEvent>), failure::Error> {
+    ) -> Result<(Option<(Vec<u8>, Stat)>, Receiver<WatchedEvent>), failure::Error> {
         let (tx, rx) = oneshot::channel();
         self.get_data_inner(path, Watch::Oneshot(tx))
             .await
             .map(|res| (res, rx))
     }
 
-    ///
-    /// Return the data and the [`Stat`] of the node at the given `path`, or
-    /// `None` if it does not exist.
-    ///
-    /// If no errors occur, a watch is left on the node at the given `path`. The
-    /// watch is triggered by any successful operation that sets the node's
-    /// data, or deletes the node, and in turn causes an event to be sent over
-    /// the provided `mpsc::Sender`.
-    ///
-    pub async fn get_data_watch_stream(
-        &self,
-        path: &str,
-        tx: MpscSender<WatchedEvent>,
-    ) -> Result<Option<(Vec<u8>, Stat)>, failure::Error> {
-        self.get_data_inner(path, Watch::Stream(tx)).await
-    }
+    // ///
+    // /// Return the data and the [`Stat`] of the node at the given `path`, or
+    // /// `None` if it does not exist.
+    // ///
+    // /// If no errors occur, a watch is left on the node at the given `path`. The
+    // /// watch is triggered by any successful operation that sets the node's
+    // /// data, or deletes the node, and in turn causes an event to be sent over
+    // /// the provided `mpsc::Sender`.
+    // ///
+    // pub async fn get_data_watch_stream(
+    //     &self,
+    //     path: &str,
+    //     tx: MpscSender<WatchedEvent>,
+    // ) -> Result<Option<ror> {
+    //     self.get_data_inner(path, Watch::Stream(tx)).await
+    // }
 
     ///
     /// Run the provided multi request.

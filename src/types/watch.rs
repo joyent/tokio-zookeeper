@@ -4,7 +4,7 @@ use futures::channel::oneshot::Sender as OneshotSender;
 #[derive(Debug)]
 pub(crate) enum Watch {
     None,
-    Stream(MpscSender<WatchedEvent>),
+    Global,
     Oneshot(OneshotSender<WatchedEvent>),
 }
 
