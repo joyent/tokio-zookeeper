@@ -1,24 +1,26 @@
-use futures::channel::oneshot::{self, Sender};
-use futures::lock::{Mutex as AsyncMutex, MutexGuard as AsyncMutexGuard};
+use futures::channel::oneshot;
+use futures::lock::Mutex as AsyncMutex;
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
 use slog::{info, Logger};
-use std::default::Default;
 use std::io::Error as IoError;
-use std::mem;
 use std::net::SocketAddr;
-use std::sync::mpsc::Receiver;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+use std::{cmp, i32, mem, u64};
 use tokio::io::{self, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
-use crate::error::ZkError;
 use crate::proto::decoder::ZkConnDecoder;
 use crate::proto::encoder::{RequestWrapper, ZkEncoder};
 use crate::proto::request::Request;
 use crate::proto::response::Response;
+
+//
+// See: https://genius.com/Built-to-spill-randy-described-eternity-lyrics
+//
+pub(crate) const LONG_TIMEOUT: Duration = Duration::from_secs(u64::MAX);
 
 ///
 /// Fields for re-connection
@@ -34,22 +36,42 @@ pub(crate) struct SessionInfo {
     pub(crate) read_only: bool,
 }
 
-impl Default for SessionInfo {
-    fn default() -> Self {
+impl SessionInfo {
+    fn new(session_timeout: Duration, read_only: bool) -> Self {
         //
-        // The default values never get used, so they don't really matter. We
-        // set the heartbeat interval to something very long (one day!) so we
-        // don't try to send a heartbeat before the initial connect request even
-        // gets sent.
+        // Squash the user-specified timeout to an i32, which is what is
+        // expected by the zk protocol.
+        //
+        // We have to do an explicit conversion rather than just a cast because
+        // casting to a smaller data length _truncates_ the data rather than
+        // rounding it down.
+        //
+        // For example, if we were casting from 5 bits to 4, we'd want 16
+        // (10000) to be rounded to 15 (1111) rather than truncated to 0 (0000).
+        //
+        // Note that it doesn't matter if the user-specified timeout gets
+        // squashed, because the maximum timeout negotiable with the server will
+        // fit in an i32 anyway.
+        //
+        let timeout = cmp::min(i32::MAX as u128, session_timeout.as_millis()) as i32;
+
+        //
+        // The starting values are immediately overwritten by the response to
+        // the first connect request, so they don't really matter.
+        //
+        // There is one exception: we set the heartbeat interval to something
+        // very long so we don't try to send a heartbeat before the initial
+        // connect request even gets sent. The heartbeat interval will then get
+        // overwritten in response to the server's connect response.
         //
         SessionInfo {
             protocol_version: 0,
             last_zxid_seen: 0,
             session_id: 0,
             password: Vec::new(),
-            timeout: 86_400_000,
-            heartbeat_interval: Duration::from_secs(86_400),
-            read_only: false,
+            timeout,
+            heartbeat_interval: LONG_TIMEOUT,
+            read_only,
         }
     }
 }
@@ -92,7 +114,7 @@ impl Default for SessionInfo {
 
 // TODO shutdown stream on cleanup
 
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub(crate) struct SessionManager {
     addr: SocketAddr,
     ///
@@ -101,25 +123,34 @@ pub(crate) struct SessionManager {
     xid: Arc<AsyncMutex<i32>>,
     // TODO having this be public is janky
     pub(crate) session_info: Arc<Mutex<SessionInfo>>,
+    exited: Arc<Mutex<bool>>,
     log: Logger,
 }
 
 impl SessionManager {
-    pub fn new(addr: SocketAddr, xid: Arc<AsyncMutex<i32>>, log: Logger) -> Self {
+    pub(crate) fn new(
+        addr: SocketAddr,
+        xid: Arc<AsyncMutex<i32>>,
+        session_timeout: Duration,
+        read_only: bool,
+        log: Logger,
+    ) -> Self {
         SessionManager {
             addr,
             xid,
-            session_info: Arc::new(Mutex::new(SessionInfo::default())),
+            session_info: Arc::new(Mutex::new(SessionInfo::new(session_timeout, read_only))),
+            exited: Arc::new(Mutex::new(false)),
             log,
         }
     }
 
     // TODO encapsulate the IoError
     // TODO implement an intelligent reconnect policy
-    // TODO actually send the reconnect message
     // TODO reset the reconnect interval to something very large
-    pub async fn reconnect(&self) -> Result<(WriteHalf<TcpStream>, ReadHalf<TcpStream>), IoError> {
-        let mut conn = TcpStream::connect(self.addr).await?;
+    pub(crate) async fn reconnect(
+        &self,
+    ) -> Result<(WriteHalf<TcpStream>, ReadHalf<TcpStream>), IoError> {
+        let conn = TcpStream::connect(self.addr).await?;
 
         let (mut conn_rx, mut conn_tx) = io::split(conn);
         //
@@ -143,6 +174,9 @@ impl SessionManager {
             }
         };
 
+        // TODO cross reference the request xid with the response xid
+        // the channel isn't necessary -- just return the response from the
+        // decoder -- I think that should work?
         let mut encoder = FramedWrite::new(&mut conn_tx, ZkEncoder::new());
         let mut decoder =
             FramedRead::new(&mut conn_rx, ZkConnDecoder::new(resp_tx, self.log.clone()));
@@ -163,7 +197,6 @@ impl SessionManager {
             read_only,
         } = resp
         {
-            // TODO handle session mgr stuff. Is there more?
             assert!(timeout >= 0);
             info!(self.log, "negotiated session timeout: {}ms", timeout);
 
@@ -172,7 +205,10 @@ impl SessionManager {
             session_info.session_id = session_id;
             mem::replace(&mut session_info.password, password.to_vec());
             session_info.timeout = timeout;
-            // TODO add explanatory comment for this math
+            //
+            // The client must send heartbeats at an interval less than the
+            // session timeout. Two-thirds the session timeout seems reasonable.
+            //
             session_info.heartbeat_interval = Duration::from_millis(2 * timeout as u64 / 3);
             session_info.read_only = read_only;
         } else {
@@ -185,8 +221,18 @@ impl SessionManager {
         Ok((conn_tx, conn_rx))
     }
 
-    pub fn get_heartbeat_interval(&self) -> Duration {
+    pub(crate) fn get_heartbeat_interval(&self) -> Duration {
         (*self.session_info.lock().unwrap()).heartbeat_interval
+    }
+
+    pub(crate) async fn close_session(&self) {
+        // TODO implement this
+        let mut exited = self.exited.lock().unwrap();
+        *exited = true;
+    }
+
+    pub(crate) fn is_exited(&self) -> bool {
+        *self.exited.lock().unwrap()
     }
 }
 

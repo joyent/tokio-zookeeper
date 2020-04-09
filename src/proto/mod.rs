@@ -1,19 +1,13 @@
 use async_trait::async_trait;
 use failure;
-use futures::Future;
 use std::net::SocketAddr;
 use tokio;
 use tokio::prelude::*;
 
 pub(crate) mod decoder;
 pub(crate) mod encoder;
-pub(crate) mod packetizer;
 pub(crate) mod request;
 pub(crate) mod response;
-pub(crate) mod session_manager;
-
-use self::request::Request;
-use self::response::Response;
 
 #[async_trait]
 pub trait ZooKeeperTransport: AsyncRead + AsyncWrite + Sized + Send {

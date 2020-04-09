@@ -1,7 +1,5 @@
-use byteorder::{BigEndian, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
 use std::borrow::Cow;
-use std::io::{self, Write};
 
 use crate::error::ZkError;
 use crate::types::acl::Acl;
@@ -12,6 +10,8 @@ use crate::types::CreateMode;
 pub(crate) enum Request {
     Ping,
     Connect {
+        // TODO make sure (here and elsewhere) that the signedness of the fields
+        // matches the signedness expected by the server
         protocol_version: i32,
         last_zxid_seen: i64,
         timeout: i32,
@@ -269,7 +269,7 @@ impl Request {
         }
     }
 
-    pub(super) fn opcode(&self) -> OpCode {
+    pub(crate) fn opcode(&self) -> OpCode {
         match *self {
             Request::Ping => OpCode::Ping,
             Request::Connect { .. } => OpCode::CreateSession,

@@ -11,12 +11,16 @@ pub enum InternalError {
     /// A server error to be handled internally.
     ///
     ServerError(ZkError),
-    ///
-    /// A generic error to be handled internally.
     /// TODO do we need this?
-    ///
     DanglingXid(i32),
-    MalformedResponse(IoError),
+    ConnectionError(IoError),
+    ConnectionEnded,
+}
+
+impl From<IoError> for InternalError {
+    fn from(e: IoError) -> InternalError {
+        InternalError::ConnectionError(e)
+    }
 }
 
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]

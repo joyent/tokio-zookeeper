@@ -1,4 +1,3 @@
-use futures::channel::mpsc::Sender as MpscSender;
 use futures::channel::oneshot::Sender as OneshotSender;
 
 #[derive(Debug)]
@@ -90,6 +89,7 @@ impl From<i32> for KeeperState {
 pub enum WatchedEventType {
     /// Nothing known has occurred on the znode. This value is issued as part of a `WatchedEvent`
     /// when the `KeeperState` changes.
+    /// TODO test that these come through
     None = -1,
     /// Issued when a znode at a given path is created.
     NodeCreated = 1,

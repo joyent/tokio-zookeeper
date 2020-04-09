@@ -1,19 +1,10 @@
-use byteorder::{BigEndian, ReadBytesExt, WriteBytesExt};
 use bytes::{BufMut, BytesMut};
-use futures::channel::mpsc::UnboundedSender;
-use futures::channel::oneshot::Sender;
-use slog::{debug, error, info, trace, Logger};
-use std::collections::HashMap;
 use std::convert::TryInto;
 use std::io::Error as IoError;
-use std::sync::{Arc, Mutex};
 use tokio_util::codec::Encoder;
 
-use crate::error::{InternalError, ZkError};
 use crate::proto::decoder::HEADER_SIZE;
-use crate::proto::request::{self, OpCode, Request};
-use crate::proto::response::{ReadFrom, Response};
-use crate::types::watch::{WatchType, WatchedEvent, WatchedEventType};
+use crate::proto::request::Request;
 
 pub(crate) struct RequestWrapper {
     pub(crate) req: Request,

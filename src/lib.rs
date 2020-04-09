@@ -219,52 +219,57 @@
 #![deny(missing_debug_implementations)]
 #![deny(missing_copy_implementations)]
 
-/// Per-operation ZooKeeper error types.
 pub mod error;
 pub mod proto;
 pub mod transform;
 pub mod types;
 
+pub(crate) mod session_manager;
+pub(crate) mod state;
+
 use failure::{bail, format_err};
-use futures::channel::mpsc::{self, UnboundedReceiver, UnboundedSender};
+use futures::channel::mpsc::{self, UnboundedReceiver};
 use futures::channel::oneshot::{self, Receiver};
-use futures::{Future, FutureExt, Stream, TryFutureExt};
-use slog::{debug, o, trace};
+use slog::{o, trace};
 use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::time;
-use tokio::net::TcpStream;
 
-use proto::packetizer::{Enqueuer, SharedState};
 use proto::request::Request;
 use proto::response::Response;
+use session_manager::LONG_TIMEOUT;
+use state::{Enqueuer, SharedState};
 use types::watch::Watch;
 use types::{Acl, CreateMode, MultiResponse, Stat, WatchedEvent};
 
 ///
 /// A connection to ZooKeeper.
 ///
-/// All interactions with ZooKeeper are performed by calling the methods of a `ZooKeeper` instance.
-/// All clones of the same `ZooKeeper` instance use the same underlying connection. Once a
-/// connection to a server is established, a session ID is assigned to the client. The client will
-/// send heart beats to the server periodically to keep the session valid.
+/// All interactions with ZooKeeper are performed by calling the methods of a
+/// `ZooKeeper` instance. All clones of a given `ZooKeeper` instance use the
+/// same underlying connection. Once a connection to a server is established,
+/// the server assigns a session ID to the client. The client will send
+/// heartbeats to the server periodically to keep the session valid.
 ///
-/// The application can call ZooKeeper APIs through a client as long as the session ID of the
-/// client remains valid. If for some reason, the client fails to send heart beats to the server
-/// for a prolonged period of time (exceeding the session timeout value, for instance), the server
-/// will expire the session, and the session ID will become invalid. The `ZooKeeper` instance will
-/// then no longer be usable, and all futures will resolve with a protocol-level error. To make
-/// further ZooKeeper API calls, the application must create a new `ZooKeeper` instance.
+/// An application can use the client as long as the session ID of the client
+/// remains valid. If for some reason, the client fails to send heartbeats to
+/// the server for a period of time exceeding the session timeout value,
+/// the server will expire the session, and the session ID will become invalid.
+/// The `ZooKeeper` instance will then no longer be usable, and all futures will
+/// resolve with a protocol-level error. To make further ZooKeeper API calls,
+/// the application must create a new `ZooKeeper` instance.
 ///
-/// If the ZooKeeper server the client currently connects to fails or otherwise does not respond,
-/// the client will automatically try to connect to another server before its session ID expires.
-/// If successful, the application can continue to use the client. TODO is this paragraph true?
+/// If the connected server becomes unreachable, the client will automatically
+/// try to connect to another server before its session ID expires. If
+/// successful, the application can continue to use the client. If unsuccessful,
+/// the client will attempt to reconnect to the servers at intervals determined
+/// by an exponential backoff, until the session expires.
 ///
-/// Some successful ZooKeeper API calls can leave watches on the "data nodes" in the ZooKeeper
-/// server. Other successful ZooKeeper API calls can trigger those watches. Once a watch is
-/// triggered, an event will be delivered to the client which left the watch at the first place.
-/// Each watch can be triggered only once. Thus, up to one event will be delivered to a client for
-/// every watch it leaves.
+/// Some successful ZooKeeper API calls can leave watches on the "data nodes" in
+/// the ZooKeeper server. Other successful ZooKeeper API calls can trigger those
+/// watches. Once a watch is triggered, an event will be delivered to the client
+/// that set the watch. Each watch can be triggered only once. Thus, up to one
+/// event will be delivered to a client for every watch it leaves.
 ///
 #[derive(Debug, Clone)]
 pub struct ZooKeeper {
@@ -279,6 +284,7 @@ pub struct ZooKeeper {
 #[derive(Debug, Clone)]
 pub struct ZooKeeperBuilder {
     session_timeout: time::Duration,
+    read_only: bool,
     logger: slog::Logger,
 }
 
@@ -288,8 +294,12 @@ impl Default for ZooKeeperBuilder {
         let root = slog::Logger::root(drain, o!());
 
         ZooKeeperBuilder {
-            // TODO make this a constant
-            session_timeout: time::Duration::from_secs(86_400),
+            //
+            // This default value will be negotiated down to the longest
+            // timeout the server supports.
+            //
+            session_timeout: LONG_TIMEOUT,
+            read_only: false,
             logger: root,
         }
     }
@@ -302,25 +312,22 @@ impl ZooKeeperBuilder {
     /// Session establishment is asynchronous. This constructor will initiate connection to the
     /// server and return immediately - potentially (usually) before the session is fully
     /// established. When the session is established, a `ZooKeeper` instance is returned, along
-    /// with a "watcher" that will provide notifications of any changes in state.
+    /// with a default watcher that will provide notifications of server state
+    /// changes and watches on ZooKeeper nodes.
     ///
-    /// If the connection to the server fails, the client will automatically try to re-connect.
-    /// Only if re-connection fails is an error returned to the client. Requests that are in-flight
-    /// during a disconnect may fail and have to be retried.
+    /// If the servers in the cluster become unreachable, the client will
+    /// attempt to reconnect until the session timeout expires. Only then should
+    /// the application call connect() again.
     ///
     pub async fn connect(
         self,
         addr: &SocketAddr,
     ) -> Result<(ZooKeeper, UnboundedReceiver<WatchedEvent>), failure::Error> {
         let addr = *addr;
-        // TODO make sure the logic works out so the session manager doesn't enqueue its
-        // own connect request when it starts up, leading to two connect requests
-        // TODO plumb session timeout through from user to inner workings
-        // TODO allow user to specify read-only?
-        debug!(self.logger, "enqueueing connect request");
-        let plog = self.logger.clone();
+        let log = self.logger.clone();
         let (tx, rx) = mpsc::unbounded();
-        let enqueuer = SharedState::start(addr, tx, plog).await;
+        let enqueuer =
+            SharedState::start(addr, tx, self.session_timeout, self.read_only, log).await;
         Ok((
             ZooKeeper {
                 connection: enqueuer,
@@ -331,18 +338,23 @@ impl ZooKeeperBuilder {
         // TODO should this function ever return an error?
     }
 
+    ///
     /// Set the ZooKeeper [session expiry
     /// timeout](https://zookeeper.apache.org/doc/r3.4.12/zookeeperProgrammers.html#ch_zkSessions).
     ///
-    /// The default timeout is dictated by the server.
+    /// By default, the timeout will be the longest interval the server
+    /// supports.
+    ///
     pub fn set_timeout(&mut self, t: time::Duration) {
         self.session_timeout = t;
     }
 
+    ///
     /// Set the logger that should be used internally in the ZooKeeper client.
     ///
     /// By default, all logging is disabled. See also [the `slog`
     /// documentation](https://docs.rs/slog).
+    ///
     pub fn set_logger(&mut self, l: slog::Logger) {
         self.logger = l;
     }
@@ -555,6 +567,19 @@ impl ZooKeeper {
     /// If no errors occur, a watch will be left on the node at the given
     /// `path`. The watch is triggered by any successful operation that creates
     /// or deletes the node, or sets the data on the node, and in turn causes
+    /// an event to be sent over the default watcher.
+    ///
+    pub async fn exists_watch(&self, path: &str) -> Result<Option<Stat>, failure::Error> {
+        self.exists_inner(path, Watch::Global).await
+    }
+
+    ///
+    /// Return the [`Stat`] of the node of the given `path`, or `None` if the
+    /// node does not exist.
+    ///
+    /// If no errors occur, a watch will be left on the node at the given
+    /// `path`. The watch is triggered by any successful operation that creates
+    /// or deletes the node, or sets the data on the node, and in turn causes
     /// the returned `oneshot::Receiver` to resolve.
     ///
     pub async fn exists_watch_oneshot(
@@ -566,22 +591,6 @@ impl ZooKeeper {
             .await
             .map(|res| (res, rx))
     }
-
-    // ///
-    // /// Return the [`Stat`] of the node of the given `path`, or `None` if the
-    // /// node does not exist.
-    // ///
-    // /// If no errors occur, a watch will be left on the node at the given
-    // /// `path`. The watch is triggered by any successful operation that creates
-    // /// or deletes the node, or sets the data on the node, and in turn causes an
-    // /// event to be sent over the provided `mpsc::Sender`.
-    // ///
-    // pub async fn exists_watch_stream(
-    //     &self,
-    //     path: &str,
-    //     tx: MpscSender<WatchedEvent>,
-    // ) -> Result<Option<St     self.exists_inner(path, Watch::Stream(tx)).await
-    // }
 
     async fn get_children_inner(
         &self,
@@ -619,6 +628,25 @@ impl ZooKeeper {
     /// If no errors occur, a watch is left on the node at the given `path`. The
     /// watch is triggered by any successful operation that deletes the node at
     /// the given `path`, or creates or deletes a child of that node, and in
+    /// turn causes an event to be sent over the default watcher.
+    ///
+    pub async fn get_children_watch(
+        &self,
+        path: &str,
+    ) -> Result<Option<Vec<String>>, failure::Error> {
+        self.get_children_inner(path, Watch::Global).await
+    }
+
+    ///
+    /// Return the names of the children of the node at the given `path`, or
+    /// `None` if the node does not exist.
+    ///
+    /// The returned list of children is not sorted and no guarantee is provided
+    /// as to its natural or lexical order.
+    ///
+    /// If no errors occur, a watch is left on the node at the given `path`. The
+    /// watch is triggered by any successful operation that deletes the node at
+    /// the given `path`, or creates or deletes a child of that node, and in
     /// turn causes the returned `oneshot::Receiver` to resolve.
     ///
     pub async fn get_children_watch_oneshot(
@@ -630,26 +658,6 @@ impl ZooKeeper {
             .await
             .map(|res| (res, rx))
     }
-
-    // ///
-    // /// Return the names of the children of the node at the given `path`, or
-    // /// `None` if the node does not exist.
-    // ///
-    // /// The returned list of children is not sorted and no guarantee is provided
-    // /// as to its natural or lexical order.
-    // ///
-    // /// If no errors occur, a watch is left on the node at the given `path`. The
-    // /// watch is triggered by any successful operation that deletes the node at
-    // /// the given `path`, or creates or deletes a child of that node, and in
-    // /// turn causes an event to be sent over the provided `mpsc::Sender`.
-    // ///
-    // pub async fn get_children_watch_stream(
-    //     &self,
-    //     path: &str,
-    //     tx: MpscSender<WatchedEvent>,
-    // ) -> Result<Option< {
-    //     self.get_children_inner(path, Watch::Stream(tx)).await
-    // }
 
     async fn get_data_inner(
         &self,
@@ -680,6 +688,22 @@ impl ZooKeeper {
     ///
     /// If no errors occur, a watch is left on the node at the given `path`. The
     /// watch is triggered by any successful operation that sets the node's
+    /// data, or deletes the node, and in turn causes an event to be sent over
+    /// the default watcher.
+    ///
+    pub async fn get_data_watch(
+        &self,
+        path: &str,
+    ) -> Result<Option<(Vec<u8>, Stat)>, failure::Error> {
+        self.get_data_inner(path, Watch::Global).await
+    }
+
+    ///
+    /// Return the data and the [`Stat`] of the node at the given `path`, or
+    /// `None` if it does not exist.
+    ///
+    /// If no errors occur, a watch is left on the node at the given `path`. The
+    /// watch is triggered by any successful operation that sets the node's
     /// data, or deletes the node, and in turn causes the returned
     /// `oneshot::Receiver` to resolve.
     ///
@@ -692,23 +716,6 @@ impl ZooKeeper {
             .await
             .map(|res| (res, rx))
     }
-
-    // ///
-    // /// Return the data and the [`Stat`] of the node at the given `path`, or
-    // /// `None` if it does not exist.
-    // ///
-    // /// If no errors occur, a watch is left on the node at the given `path`. The
-    // /// watch is triggered by any successful operation that sets the node's
-    // /// data, or deletes the node, and in turn causes an event to be sent over
-    // /// the provided `mpsc::Sender`.
-    // ///
-    // pub async fn get_data_watch_stream(
-    //     &self,
-    //     path: &str,
-    //     tx: MpscSender<WatchedEvent>,
-    // ) -> Result<Option<ror> {
-    //     self.get_data_inner(path, Watch::Stream(tx)).await
-    // }
 
     ///
     /// Run the provided multi request.
