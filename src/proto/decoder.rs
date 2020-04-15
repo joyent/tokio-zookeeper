@@ -5,14 +5,12 @@ use futures::channel::oneshot::Sender;
 use slog::{debug, info, trace, Logger};
 use std::collections::HashMap;
 use std::io::Error as IoError;
-use std::mem;
 use std::sync::{Arc, Mutex};
 use tokio_util::codec::Decoder;
 
 use crate::error::{InternalError, ZkError};
 use crate::proto::request::{self, OpCode};
-use crate::proto::response::{ReadFrom, Response};
-use crate::session_manager::SessionInfo;
+use crate::proto::response::{ReadFrom, Response, HEARTBEAT_XID, SHUTDOWN_XID, WATCH_XID};
 use crate::types::watch::{WatchType, WatchedEvent, WatchedEventType};
 
 //
@@ -48,10 +46,6 @@ pub(crate) struct ZkDecoder {
     /// Sending end of default watch stream
     ///
     default_watcher: UnboundedSender<WatchedEvent>,
-    ///
-    /// A reference to the SessionManager's SessionInfo
-    ///
-    session_info: Arc<Mutex<SessionInfo>>,
     log: Logger,
 }
 
@@ -61,7 +55,6 @@ impl ZkDecoder {
         watches: Arc<Mutex<HashMap<String, Vec<(Sender<WatchedEvent>, WatchType)>>>>,
         pending_watches: Arc<Mutex<HashMap<i32, (String, Sender<WatchedEvent>, WatchType)>>>,
         default_watcher: UnboundedSender<WatchedEvent>,
-        session_info: Arc<Mutex<SessionInfo>>,
         log: Logger,
     ) -> Self {
         ZkDecoder {
@@ -69,29 +62,20 @@ impl ZkDecoder {
             watches,
             pending_watches,
             default_watcher,
-            session_info,
             log,
-        }
-    }
-
-    fn handle_new_zxid(&self, zxid: i64) {
-        if zxid > 0 {
-            let mut session_info = self.session_info.lock().unwrap();
-            trace!(
-                self.log,
-                "updated zxid from {} to {}",
-                session_info.last_zxid_seen,
-                zxid
-            );
-
-            assert!(zxid >= session_info.last_zxid_seen);
-            session_info.last_zxid_seen = zxid;
         }
     }
 }
 
+// TODO eliminate all uses of non-async mutex
+// non-async mutexes should not be used from async contexts, because they
+// block the whole thread and don't allow tasks to progress. This isn't a huge
+// deal here because there are only two threads and they intimately share state.
+// We should still get rid of the regular mutexes, though.
+
 impl Decoder for ZkDecoder {
-    type Item = Result<(), InternalError>;
+    // The result is the zxid of the encoded message
+    type Item = Result<i64, InternalError>;
     //
     // This is for unrecoverable errors.
     // The Decoder trait requires this type to be convertible to an IoError, so
@@ -127,14 +111,13 @@ impl Decoder for ZkDecoder {
             src.reserve(msg_len);
             return Ok(None);
         }
-
         let mut err = None;
 
         // Deserialize xid and zxid
         let xid = buf.read_i32::<BigEndian>()?;
         let zxid = buf.read_i64::<BigEndian>()?;
 
-        self.handle_new_zxid(zxid);
+        // self.handle_new_zxid(zxid);
 
         // Deserialize error
         let zk_err: ZkError = buf.read_i32::<BigEndian>()?.into();
@@ -146,7 +129,7 @@ impl Decoder for ZkDecoder {
         // Response to shutdown. The response is empty beyond the xid/zxid/err.
         // In theory, the server should now shut down its end of the connection.
         //
-        if xid == 0 {
+        if xid == SHUTDOWN_XID {
             trace!(self.log, "got response to CloseSession");
             if let Some(e) = err {
                 src.advance(msg_len + HEADER_SIZE);
@@ -155,7 +138,8 @@ impl Decoder for ZkDecoder {
         //
         // A watch has triggered.
         //
-        } else if xid == -1 {
+        } else if xid == WATCH_XID {
+            // TODO make sure we set the session state based on the event
             // Deserialize the WatchedEvent
             let e = WatchedEvent::read_from(&mut buf)?;
             trace!(self.log, "got watch event {:?}", e);
@@ -224,11 +208,9 @@ impl Decoder for ZkDecoder {
                 let _ = self.default_watcher.unbounded_send(e);
             }
         //
-        // TODO remove magic numbers like -2 here
         // Response to ping. The response is empty beyond the xid/zxid/err.
         //
-        } else if xid == -2 {
-            println!("heartbeat responded to");
+        } else if xid == HEARTBEAT_XID {
             trace!(self.log, "got response to heartbeat");
             if let Some(e) = err {
                 src.advance(msg_len + HEADER_SIZE);
@@ -310,50 +292,24 @@ impl Decoder for ZkDecoder {
         src.advance(msg_len + HEADER_SIZE);
         // Set aside space for the next frame (TODO optimize for minimum actual frame size?)
         src.reserve(HEADER_SIZE);
-        wrap(Ok(()))
-
-        // TODO some activepacketizer logic ends up here; some ends up in other places --
-        // make sure we've accounted for all of it!
+        wrap(Ok(zxid))
 
         // TODO add logging everywhere; uncomment existing log lines
 
-        // TODO implement decode_eof?
-
         // TODO write a comment explaining all the various nested errors and control flow here
         // TODO handle keeperstate somehow? Not sure tbh
-        // TODO send state changes over default watcher? The existing impl seems
-        // to only return state in response to API requests (as either errors or KeeperState enum), which makes
-        // sense I guess, as these requests are the only time the user interacts with the server.
     }
 }
 
-pub(crate) struct ZkConnDecoder {
-    ///
-    /// tx over which to send response
-    ///
-    response_tx: Option<Sender<Result<Response, ZkError>>>,
-    log: Logger,
-}
-
-impl ZkConnDecoder {
-    pub fn new(response_tx: Sender<Result<Response, ZkError>>, log: Logger) -> Self {
-        ZkConnDecoder {
-            response_tx: Some(response_tx),
-            log,
-        }
-    }
-}
+pub(crate) struct ZkConnDecoder {}
 
 impl Decoder for ZkConnDecoder {
-    type Item = Result<(), InternalError>;
+    type Item = Response;
     //
-    // This is for unrecoverable errors. We never actually return this.
-    // The Decoder trait requires this type to be convertible to an IoError, so
-    // we just use the IoError itself.
+    // This is for unrecoverable errors.
     //
-    type Error = IoError;
+    type Error = InternalError;
 
-    // TODO refactor this big boy function
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         //
         // We can read from the slice and take advantage of its cursor-tracking
@@ -378,21 +334,8 @@ impl Decoder for ZkConnDecoder {
             return Ok(None);
         }
 
-        //
-        // The ZkConnDecoder is a one-shot deal. It shouldn't be used to decode
-        // more than one message. TODO if this changes, make sure we advance() and reserve() the buffer.
-        //
-        let response_tx = mem::replace(&mut self.response_tx, None)
-            .expect("ZkConnDecoder has received more than one message");
-
-        let response = Response::parse(OpCode::CreateSession, &mut buf).map(|r| {
-            debug!(self.log, "handling server connect response: {:?}", r);
-            response_tx
-                .send(Ok(r))
-                .expect("Internal rx for response dropped");
-            Some(Ok(()))
-        });
-        response
-        // TODO implement decode_eof?
+        Response::parse(OpCode::CreateSession, &mut buf)
+            .map(|r| Some(r))
+            .map_err(InternalError::from)
     }
 }

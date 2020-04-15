@@ -15,6 +15,7 @@ pub enum InternalError {
     DanglingXid(i32),
     ConnectionError(IoError),
     ConnectionEnded,
+    ReconnectTimeout,
 }
 
 impl From<IoError> for InternalError {

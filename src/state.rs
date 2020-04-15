@@ -31,7 +31,7 @@ use crate::proto::decoder::ZkDecoder;
 use crate::proto::encoder::{RequestWrapper, ZkEncoder};
 use crate::proto::{
     request::{OpCode, Request},
-    response::Response,
+    response::{Response, FIRST_XID, HEARTBEAT_XID, SHUTDOWN_XID, WATCH_XID},
 };
 use crate::session_manager::SessionManager;
 use crate::types::watch::{WatchType, WatchedEvent};
@@ -121,7 +121,7 @@ impl SharedState {
         let barrier = Arc::new(Barrier::new(2));
         let bg_barrier = Arc::clone(&barrier);
 
-        let xid = Arc::new(AsyncMutex::new(0));
+        let xid = Arc::new(AsyncMutex::new(FIRST_XID));
 
         let (tx, rx) = mpsc::unbounded();
 
@@ -147,7 +147,7 @@ impl SharedState {
                 xid,
                 req_tx: tx,
                 rx: Arc::new(AsyncMutex::new(rx)),
-                log,
+                log: log.clone(),
                 sess_mgr,
                 replies: Arc::new(Mutex::new(HashMap::new())),
                 pending_watches: Arc::new(Mutex::new(HashMap::new())),
@@ -155,16 +155,15 @@ impl SharedState {
                 default_watcher,
                 addr,
             };
-            s.run(bg_barrier, abort_handles).await
-            // .map_err(move |e| {
-            //     error!(exitlogger, "packetizer exiting: {:?}", e);
-            //     drop(e);
+            match s.run(bg_barrier, abort_handles).await {
+                Err(e) => error!(log, "Client exiting with error: {:?}", e),
+                Ok(_) => info!(log, "Client exiting"),
+            }
         });
         barrier.wait().await;
+
         // TODO should this function ever return an error?
 
-        // TODO make sure we only unwrap where absolutely ok/necessary and properly
-        // handle errors otherwise
         enqueuer
     }
 
@@ -172,15 +171,18 @@ impl SharedState {
         &mut self,
         barrier: Arc<Barrier>,
         abort_handles: Arc<Mutex<Option<(AbortHandle, AbortHandle)>>>,
-    ) {
+    ) -> Result<(), InternalError> {
         let mut first = true;
         loop {
-            if self.sess_mgr.is_exited() {
-                info!(self.log, "client exiting");
-                return;
+            if self.sess_mgr.is_exited().await {
+                return Ok(());
             }
-            // TODO handle error or get rid of it
-            let (tx, rx) = self.sess_mgr.reconnect().await.unwrap();
+
+            //
+            // If we really can't reconnect, we have no choice but to exit.
+            //
+            let (tx, rx) = self.sess_mgr.reconnect().await?;
+
             //
             // Allow the initial call to start() to resolve
             //
@@ -239,11 +241,12 @@ impl SharedState {
     ) -> InternalError {
         async fn recv_msg(
             decoder: &mut FramedRead<ReadHalf<TcpStream>, ZkDecoder>,
+            sess_mgr: SessionManager,
             log: Logger,
         ) -> Result<(), InternalError> {
             match decoder.next().await {
                 Some(item) => {
-                    if let Err(e) = item? {
+                    match item? {
                         //
                         // The decoder encountered some server error to be
                         // handled internally, or client logic error. We can't
@@ -251,7 +254,8 @@ impl SharedState {
                         //
                         // TODO I'm not sure that these should ever happen --
                         // should we panic instead in decoder if they do?
-                        error!(log, "Server Error; doing nothing: {:?}", e);
+                        Err(e) => error!(log, "Server Error; doing nothing: {:?}", e),
+                        Ok(zxid) => sess_mgr.set_zxid(zxid).await,
                     }
                     Ok(())
                 }
@@ -266,13 +270,12 @@ impl SharedState {
                 Arc::clone(&self.watches),
                 Arc::clone(&self.pending_watches),
                 self.default_watcher.clone(),
-                Arc::clone(&self.sess_mgr.session_info),
                 self.log.clone(),
             ),
         );
 
         loop {
-            if let Err(e) = recv_msg(&mut decoder, self.log.clone()).await {
+            if let Err(e) = recv_msg(&mut decoder, self.sess_mgr.clone(), self.log.clone()).await {
                 //
                 // The stream encountered an unrecoverable error. We stop the
                 // encoder and then exit ourselves.
@@ -294,35 +297,32 @@ impl SharedState {
         // across reconnects, so it's safe to only fetch the heartbeat interval
         // once.
         //
-        let heartbeat_interval = self.sess_mgr.get_heartbeat_interval();
+        let heartbeat_interval = self.sess_mgr.get_heartbeat_interval().await;
         // TODO look into SinkExt::with() and send_all() instead of looping manually?
         loop {
             let timeout_result =
                 time::timeout(heartbeat_interval, self.rx.lock().await.next()).await;
-
-            //
-            // Heartbeat interval elapsed without us having anything to send.
-            // Send a heartbeat!
-            //
-            if timeout_result.is_err() {
-                if let Err(e) = encoder
-                    .send(RequestWrapper {
-                        xid: -2,
-                        req: Request::Ping,
-                    })
-                    .await
-                {
-                    dec_abort_handle.abort();
-                    return InternalError::from(e);
+            let (mut request, response_tx) = match timeout_result {
+                Err(_) => {
+                    //
+                    // Heartbeat interval elapsed without us having anything to
+                    // send. Send a heartbeat!
+                    //
+                    if let Err(e) = encoder
+                        .send(RequestWrapper {
+                            xid: HEARTBEAT_XID,
+                            req: Request::Ping,
+                        })
+                        .await
+                    {
+                        println!("damn");
+                        dec_abort_handle.abort();
+                        return InternalError::from(e);
+                    }
+                    continue;
                 }
-                continue;
-            }
-
-            // TODO this unwrap is always safe but it looks sketchy -- refactor?
-            let (mut request, response_tx) = match timeout_result.unwrap() {
-                Some(tuple) => tuple,
-                None => {
-                    unreachable!("internal enqueuer rx dropped");
+                Ok(tuple) => {
+                    tuple.expect("internal enqueuer rx dropped")
                     //
                     // TODO I'm not sure if this is right
                     // The user dropped the handle to zk.
@@ -338,9 +338,18 @@ impl SharedState {
                     // return;
                 }
             };
+
             let mut xid_handle = self.xid.lock().await;
+            // Skip special xids
+            while *xid_handle == SHUTDOWN_XID
+                || *xid_handle == WATCH_XID
+                || *xid_handle == HEARTBEAT_XID
+            {
+                *xid_handle += 1;
+            }
             let new_xid = *xid_handle;
             *xid_handle += 1;
+
             debug!(self.log, "enqueueing request {:?}", request; "xid" => new_xid);
 
             //

@@ -8,6 +8,11 @@ use crate::types::acl::Acl;
 use crate::types::watch::{WatchedEvent, WatchedEventType};
 use crate::types::{KeeperState, Permission, Stat};
 
+pub(crate) const SHUTDOWN_XID: i32 = 0;
+pub(crate) const WATCH_XID: i32 = -1;
+pub(crate) const HEARTBEAT_XID: i32 = -2;
+pub(crate) const FIRST_XID: i32 = 1;
+
 #[derive(Debug)]
 pub(crate) enum Response {
     Connect {
@@ -144,7 +149,7 @@ trait StringReader: Read {
 impl<R: Read> StringReader for R {
     fn read_string(&mut self) -> IoResult<String> {
         let raw = self.read_buffer()?;
-        Ok(String::from_utf8(raw).unwrap())
+        Ok(String::from_utf8(raw).expect("Bytes are not utf8"))
     }
 }
 

@@ -309,11 +309,14 @@ impl ZooKeeperBuilder {
     ///
     /// Connect to a ZooKeeper server instance at the given address.
     ///
-    /// Session establishment is asynchronous. This constructor will initiate connection to the
-    /// server and return immediately - potentially (usually) before the session is fully
-    /// established. When the session is established, a `ZooKeeper` instance is returned, along
-    /// with a default watcher that will provide notifications of server state
-    /// changes and watches on ZooKeeper nodes.
+    /// This function returns a `ZooKeeper` instance, along with a default
+    /// watcher that will provide notifications of server state changes and
+    /// watches on ZooKeeper nodes.
+    ///
+    /// This function cannot fail. The client will repeatedly attempt to connect
+    /// to the server (with exponential backoff) until the session is
+    /// established. There is no upper bound on the time to connect, because the
+    /// session hasn't been established yet, so there is no session to time out.
     ///
     /// If the servers in the cluster become unreachable, the client will
     /// attempt to reconnect until the session timeout expires. Only then should

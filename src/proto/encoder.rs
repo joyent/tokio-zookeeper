@@ -33,11 +33,21 @@ impl Encoder<RequestWrapper> for ZkEncoder {
             buf.put_i32(item.req.opcode() as i32);
         }
 
-        // payload
+        // Payload
         item.req.serialize_into(&mut buf);
+        //
         // write payload length into the part of the buffer we set aside
+        //
+        // XXX We should really return an error if the request is too big,
+        // rather than panicking. Not a pressing concern given that the max
+        // request size is effectively 4gb.
+        //
         let written = buf.len();
-        dst.put_u32(written.try_into().unwrap());
+        dst.put_u32(
+            written
+                .try_into()
+                .expect("Number of bytes written does not fit into u32"),
+        );
 
         // Join length and payload
         dst.unsplit(buf);
