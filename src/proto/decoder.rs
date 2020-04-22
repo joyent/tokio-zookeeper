@@ -11,7 +11,7 @@ use tokio_util::codec::Decoder;
 use crate::error::{InternalError, ZkError};
 use crate::proto::request::{self, OpCode};
 use crate::proto::response::{ReadFrom, Response, HEARTBEAT_XID, SHUTDOWN_XID, WATCH_XID};
-use crate::types::watch::{WatchType, WatchedEvent, WatchedEventType};
+use crate::types::watch::{Watch, WatchType, WatchedEvent, WatchedEventType};
 
 //
 // The byte length of the outermost request/response packet header. The value
@@ -30,7 +30,7 @@ pub(crate) struct ZkDecoder {
     ///
     /// Global map of watches registered, indexed by path
     ///
-    watches: Arc<Mutex<HashMap<String, Vec<(Sender<WatchedEvent>, WatchType)>>>>,
+    watches: Arc<Mutex<HashMap<String, Vec<Watch>>>>,
     ///
     /// Global map of pending watches.
     ///
@@ -41,7 +41,7 @@ pub(crate) struct ZkDecoder {
     /// The one exception: a watch can still be added if a call to exists()
     /// fails because the node does not exist yet.
     ///
-    pending_watches: Arc<Mutex<HashMap<i32, (String, Sender<WatchedEvent>, WatchType)>>>,
+    pending_watches: Arc<Mutex<HashMap<i32, (String, Watch)>>>,
     ///
     /// Sending end of default watch stream
     ///
@@ -52,8 +52,8 @@ pub(crate) struct ZkDecoder {
 impl ZkDecoder {
     pub fn new(
         replies: Arc<Mutex<HashMap<i32, (OpCode, Sender<Result<Response, ZkError>>)>>>,
-        watches: Arc<Mutex<HashMap<String, Vec<(Sender<WatchedEvent>, WatchType)>>>>,
-        pending_watches: Arc<Mutex<HashMap<i32, (String, Sender<WatchedEvent>, WatchType)>>>,
+        watches: Arc<Mutex<HashMap<String, Vec<Watch>>>>,
+        pending_watches: Arc<Mutex<HashMap<i32, (String, Watch)>>>,
         default_watcher: UnboundedSender<WatchedEvent>,
         log: Logger,
     ) -> Self {
@@ -142,6 +142,7 @@ impl Decoder for ZkDecoder {
             // TODO make sure we set the session state based on the event
             // Deserialize the WatchedEvent
             let e = WatchedEvent::read_from(&mut buf)?;
+            println!("watch event received: {:?}", e);
             trace!(self.log, "got watch event {:?}", e);
 
             let mut watches = self.watches.lock().unwrap();
@@ -165,7 +166,7 @@ impl Decoder for ZkDecoder {
                 // Is it worth doing? (TODO)
                 //
                 for i in (0..watch_list.len()).rev() {
-                    let watch_matched = match (watch_list[i].1, e.event_type) {
+                    let watch_matched = match (watch_list[i].wtype, e.event_type) {
                         (WatchType::Child, WatchedEventType::NodeDeleted)
                         | (WatchType::Child, WatchedEventType::NodeChildrenChanged) => true,
                         (WatchType::Child, _) => false,
@@ -183,7 +184,13 @@ impl Decoder for ZkDecoder {
                         // the user may have dropped the receiver, and that's
                         // ok.
                         //
-                        let _ = w.0.send(e.clone());
+                        let _ = w.tx.send(e.clone());
+                    } else {
+                        //
+                        // There were other non-global watches set on this path,
+                        // but none of them matched this event.
+                        //
+                        global_watch = true;
                     }
                 }
                 if watch_list.is_empty() {
@@ -238,7 +245,7 @@ impl Decoder for ZkDecoder {
             // I think we don't, assuming we clear all pending watches upon reconnect,
             // because an interrupted request will always trigger a reconnect. I'm not sure.
             //
-            if let Some(w) = self.pending_watches.lock().unwrap().remove(&xid) {
+            if let Some((path, watch)) = self.pending_watches.lock().unwrap().remove(&xid) {
                 //
                 // Normally, a requested watch is only added once the initial
                 // operation is successful. The one exception to this is if an
@@ -251,9 +258,9 @@ impl Decoder for ZkDecoder {
                     self.watches
                         .lock()
                         .unwrap()
-                        .entry(w.0)
+                        .entry(path)
                         .or_insert_with(Vec::new)
-                        .push((w.1, w.2));
+                        .push(watch);
                 } else {
                     debug!(self.log,
                            "pending watch not turned into real watch: {:?}",

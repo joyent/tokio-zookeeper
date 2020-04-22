@@ -6,7 +6,7 @@ use futures::stream::StreamExt;
 use slog::{error, info, trace, Logger};
 use std::net::SocketAddr;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{cmp, i32, mem, u64};
 use tokio::io::{self, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
@@ -108,10 +108,10 @@ pub(crate) struct SessionManager {
     /// Next xid to issue
     ///
     xid: Arc<AsyncMutex<i32>>,
-    // TODO having this be public is janky
     session_info: Arc<AsyncMutex<SessionInfo>>,
     first: Arc<AsyncMutex<bool>>,
     exited: Arc<AsyncMutex<bool>>,
+    last_contact: Arc<AsyncMutex<Instant>>,
     log: Logger,
 }
 
@@ -132,6 +132,7 @@ impl SessionManager {
             ))),
             first: Arc::new(AsyncMutex::new(true)),
             exited: Arc::new(AsyncMutex::new(false)),
+            last_contact: Arc::new(AsyncMutex::new(Instant::now())),
             log,
         }
     }
@@ -184,6 +185,9 @@ impl SessionManager {
             match self.reconnect_inner().await {
                 Err(e) => {
                     error!(self.log, "Error connecting to ZooKeeper: {:?}", e);
+                    if let InternalError::SessionExpired = e {
+                        return Err(InternalError::SessionExpired);
+                    }
                     match backoff.next_backoff() {
                         Some(interval) => {
                             delay = interval;
@@ -211,7 +215,10 @@ impl SessionManager {
                 None => Err(InternalError::ConnectionEnded),
             }
         }
-        println!("{:?}", std::time::SystemTime::now());
+        println!(
+            "Reconnecting; current time is: {:?}",
+            std::time::SystemTime::now()
+        );
 
         let request = {
             let session_info = self.session_info.lock().await;
@@ -252,6 +259,14 @@ impl SessionManager {
         {
             info!(self.log, "handling server connect response: {:?}", resp);
             assert!(timeout >= 0);
+            //
+            // XXX This means we supplied invalid connect info from the server's
+            // point of view, implying the session is expired. This isn't
+            // necessarily a stable interface, and shouldn't be relied on.
+            //
+            if timeout == 0 {
+                return Err(InternalError::SessionExpired);
+            }
             info!(self.log, "negotiated session timeout: {}ms", timeout);
 
             let mut session_info = self.session_info.lock().await;
@@ -285,20 +300,35 @@ impl SessionManager {
     }
 
     pub(crate) async fn set_zxid(&self, zxid: i64) {
-        let mut session_info = self.session_info.lock().await;
-        trace!(
-            self.log,
-            "updated zxid from {} to {}",
-            session_info.last_zxid_seen,
-            zxid
-        );
-        assert!(zxid >= session_info.last_zxid_seen);
-        session_info.last_zxid_seen = zxid;
+        if zxid > 0 {
+            let mut session_info = self.session_info.lock().await;
+            assert!(zxid >= session_info.last_zxid_seen);
+            trace!(
+                self.log,
+                "updated zxid from {} to {}",
+                session_info.last_zxid_seen,
+                zxid
+            );
+            session_info.last_zxid_seen = zxid;
+        }
+    }
+
+    pub(crate) async fn get_zxid(&self) -> i64 {
+        self.session_info.lock().await.last_zxid_seen
     }
 
     pub(crate) async fn is_exited(&self) -> bool {
         *self.exited.lock().await
     }
+
+    //
+    // TODO make use of this for anticipating session expiry instead of using
+    // XXX section above.
+    //
+    #[allow(dead_code)]
+    pub(crate) async fn register_contact(&self) {
+        *self.last_contact.lock().await = Instant::now();
+    }
 }
 
-// TODO go through and replace all asyncmutexes with mutexes where possible
+// TODO go through and replace all mutexes with asyncmutexes where possible

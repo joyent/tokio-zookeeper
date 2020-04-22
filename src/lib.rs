@@ -239,7 +239,7 @@ use proto::request::Request;
 use proto::response::Response;
 use session_manager::LONG_TIMEOUT;
 use state::{Enqueuer, SharedState};
-use types::watch::Watch;
+use types::watch::WatchOption;
 use types::{Acl, CreateMode, MultiResponse, Stat, WatchedEvent};
 
 ///
@@ -544,7 +544,11 @@ impl ZooKeeper {
             .and_then(move |r| transform::set_acl(version, r))
     }
 
-    async fn exists_inner(&self, path: &str, watch: Watch) -> Result<Option<Stat>, failure::Error> {
+    async fn exists_inner(
+        &self,
+        path: &str,
+        watch: WatchOption,
+    ) -> Result<Option<Stat>, failure::Error> {
         trace!(self.logger, "exists"; "path" => path, "watch" => ?watch);
         self.connection
             .enqueue(Request::Exists {
@@ -560,7 +564,7 @@ impl ZooKeeper {
     /// node does not exist.
     ///
     pub async fn exists(&self, path: &str) -> Result<Option<Stat>, failure::Error> {
-        self.exists_inner(path, Watch::None).await
+        self.exists_inner(path, WatchOption::None).await
     }
 
     ///
@@ -573,7 +577,7 @@ impl ZooKeeper {
     /// an event to be sent over the default watcher.
     ///
     pub async fn exists_watch(&self, path: &str) -> Result<Option<Stat>, failure::Error> {
-        self.exists_inner(path, Watch::Global).await
+        self.exists_inner(path, WatchOption::Global).await
     }
 
     ///
@@ -590,7 +594,7 @@ impl ZooKeeper {
         path: &str,
     ) -> Result<(Option<Stat>, Receiver<WatchedEvent>), failure::Error> {
         let (tx, rx) = oneshot::channel();
-        self.exists_inner(path, Watch::Oneshot(tx))
+        self.exists_inner(path, WatchOption::Oneshot(tx))
             .await
             .map(|res| (res, rx))
     }
@@ -598,7 +602,7 @@ impl ZooKeeper {
     async fn get_children_inner(
         &self,
         path: &str,
-        watch: Watch,
+        watch: WatchOption,
     ) -> Result<Option<Vec<String>>, failure::Error> {
         trace!(self.logger, "get_children"; "path" => path, "watch" => ?watch);
         self.connection
@@ -618,7 +622,7 @@ impl ZooKeeper {
     /// as to its natural or lexical order.
     ///
     pub async fn get_children(&self, path: &str) -> Result<Option<Vec<String>>, failure::Error> {
-        self.get_children_inner(path, Watch::None).await
+        self.get_children_inner(path, WatchOption::None).await
     }
 
     ///
@@ -637,7 +641,7 @@ impl ZooKeeper {
         &self,
         path: &str,
     ) -> Result<Option<Vec<String>>, failure::Error> {
-        self.get_children_inner(path, Watch::Global).await
+        self.get_children_inner(path, WatchOption::Global).await
     }
 
     ///
@@ -657,7 +661,7 @@ impl ZooKeeper {
         path: &str,
     ) -> Result<(Option<Vec<String>>, Receiver<WatchedEvent>), failure::Error> {
         let (tx, rx) = oneshot::channel();
-        self.get_children_inner(path, Watch::Oneshot(tx))
+        self.get_children_inner(path, WatchOption::Oneshot(tx))
             .await
             .map(|res| (res, rx))
     }
@@ -665,7 +669,7 @@ impl ZooKeeper {
     async fn get_data_inner(
         &self,
         path: &str,
-        watch: Watch,
+        watch: WatchOption,
     ) -> Result<Option<(Vec<u8>, Stat)>, failure::Error> {
         trace!(self.logger, "get_data"; "path" => path, "watch" => ?watch);
         self.connection
@@ -682,7 +686,7 @@ impl ZooKeeper {
     /// `None` if it does not exist.
     ///
     pub async fn get_data(&self, path: &str) -> Result<Option<(Vec<u8>, Stat)>, failure::Error> {
-        self.get_data_inner(path, Watch::None).await
+        self.get_data_inner(path, WatchOption::None).await
     }
 
     ///
@@ -698,7 +702,7 @@ impl ZooKeeper {
         &self,
         path: &str,
     ) -> Result<Option<(Vec<u8>, Stat)>, failure::Error> {
-        self.get_data_inner(path, Watch::Global).await
+        self.get_data_inner(path, WatchOption::Global).await
     }
 
     ///
@@ -715,7 +719,7 @@ impl ZooKeeper {
         path: &str,
     ) -> Result<(Option<(Vec<u8>, Stat)>, Receiver<WatchedEvent>), failure::Error> {
         let (tx, rx) = oneshot::channel();
-        self.get_data_inner(path, Watch::Oneshot(tx))
+        self.get_data_inner(path, WatchOption::Oneshot(tx))
             .await
             .map(|res| (res, rx))
     }
@@ -831,7 +835,7 @@ impl MultiRequest {
 //     use super::*;
 
 //     use slog::Drain;
-//     use types::watch::{KeeperState, WatchedEventType};
+//     use types::watchOption::{KeeperState, WatchedEventType};
 
 //     #[test]
 //     fn it_works() {

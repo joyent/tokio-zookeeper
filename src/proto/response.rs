@@ -194,6 +194,7 @@ impl Response {
                 }
                 Ok(Response::Multi(responses))
             }
+            OpCode::SetWatches => Ok(Response::Empty),
             _ => panic!("got unexpected response opcode {:?}", opcode),
         }
     }

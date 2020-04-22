@@ -1,5 +1,7 @@
 use failure_derive::Fail;
-use std::io::Error as IoError;
+use futures::channel::mpsc::TrySendError;
+use futures::channel::oneshot::Canceled;
+use std::io::{Error as IoError, ErrorKind as IoErrorKind};
 
 ///
 /// Represents errors handled internally by the client, as opposed to being
@@ -15,12 +17,32 @@ pub enum InternalError {
     DanglingXid(i32),
     ConnectionError(IoError),
     ConnectionEnded,
+    // TODO maybe we should just always use SessionExpired and get rid of ReconnectTimeout
     ReconnectTimeout,
+    SessionExpired,
 }
 
 impl From<IoError> for InternalError {
     fn from(e: IoError) -> InternalError {
         InternalError::ConnectionError(e)
+    }
+}
+
+impl From<Canceled> for InternalError {
+    fn from(_: Canceled) -> InternalError {
+        InternalError::ConnectionError(IoError::new(IoErrorKind::Other, "Request canceled"))
+    }
+}
+
+impl<T> From<TrySendError<T>> for InternalError {
+    fn from(_: TrySendError<T>) -> InternalError {
+        InternalError::ConnectionError(IoError::new(IoErrorKind::Other, "Request canceled"))
+    }
+}
+
+impl From<ZkError> for InternalError {
+    fn from(e: ZkError) -> InternalError {
+        InternalError::ServerError(e)
     }
 }
 

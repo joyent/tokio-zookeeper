@@ -14,7 +14,7 @@ use futures::{
 };
 use slog;
 use slog::{debug, error, info, Logger};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::mem;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
@@ -34,8 +34,7 @@ use crate::proto::{
     response::{Response, FIRST_XID, HEARTBEAT_XID, SHUTDOWN_XID, WATCH_XID},
 };
 use crate::session_manager::SessionManager;
-use crate::types::watch::{WatchType, WatchedEvent};
-use crate::Watch;
+use crate::types::watch::{Watch, WatchOption, WatchType, WatchedEvent};
 
 //
 // This struct exists so the enqueuer can have a handle to the client's
@@ -93,11 +92,11 @@ pub(crate) struct SharedState {
     /// The one exception: a watch can still be added if a call to exists()
     /// fails because the node does not exist yet.
     ///
-    pending_watches: Arc<Mutex<HashMap<i32, (String, Sender<WatchedEvent>, WatchType)>>>,
+    pending_watches: Arc<Mutex<HashMap<i32, (String, Watch)>>>,
     ///
     /// Global map of watches registered, indexed by path
     ///
-    watches: Arc<Mutex<HashMap<String, Vec<(Sender<WatchedEvent>, WatchType)>>>>,
+    watches: Arc<Mutex<HashMap<String, Vec<Watch>>>>,
     ///
     /// Default watcher for state change events and non-custom watch events
     ///
@@ -156,6 +155,8 @@ impl SharedState {
                 addr,
             };
             match s.run(bg_barrier, abort_handles).await {
+                // TODO destroy watches so any waiting channels resolve with
+                // error
                 Err(e) => error!(log, "Client exiting with error: {:?}", e),
                 Ok(_) => info!(log, "Client exiting"),
             }
@@ -181,7 +182,18 @@ impl SharedState {
             //
             // If we really can't reconnect, we have no choice but to exit.
             //
-            let (tx, rx) = self.sess_mgr.reconnect().await?;
+            let (tx, rx) = self.sess_mgr.reconnect().await.map_err(|e| {
+                //
+                // We need to clear these before we exit so any inflight
+                // requests sent using req_tx (e.g. reregister_watches) get
+                // canceled. We need to make sure they get canceled so all
+                // associated threads exit and the SharedState gets dropped,
+                // ensuring proper shutdown.
+                //
+                self.replies.lock().unwrap().clear();
+                self.pending_watches.lock().unwrap().clear();
+                e
+            })?;
 
             //
             // Allow the initial call to start() to resolve
@@ -189,6 +201,18 @@ impl SharedState {
             if first {
                 first = false;
                 barrier.wait().await;
+            } else {
+                self.replies.lock().unwrap().clear();
+                self.pending_watches.lock().unwrap().clear();
+                let mut reregister_state = self.clone();
+                tokio::task::spawn(async move {
+                    if let Err(e) = reregister_state.reregister_watches().await {
+                        error!(
+                            reregister_state.log,
+                            "Error re-registering watches: {:?}", e
+                        );
+                    }
+                });
             }
             // TODO I will have to think about a lot of edge cases with interrupted
             // reconnect loop state probably
@@ -221,17 +245,56 @@ impl SharedState {
             // If these futures are aborted, we don't need to do anything other
             // than begin the reconnect loop again.
             //
-            if let Ok(e) = enc_task_handle.await {
-                error!(self.log, "Encoder error: {:?}", e);
-            } else {
-                debug!(self.log, "encoder future aborted");
-            }
+            // TODO the error layering here is wrongly interpreted
+            // TODO simplify abort logic -- just wait for a reliable failure
+            // (e.g. the decoder) and then abort the encoder, rather than
+            // having them fine-grained abort each other? Not sure if that
+            // would work ok.
             if let Ok(e) = dec_task_handle.await {
+                println!("Decoder error: {:?}", e);
                 error!(self.log, "Decoder error: {:?}", e);
             } else {
+                println!("decoder future aborted");
                 debug!(self.log, "decoder future aborted");
             }
+            if let Ok(e) = enc_task_handle.await {
+                println!("Encoder error: {:?}", e);
+                error!(self.log, "Encoder error: {:?}", e);
+            } else {
+                println!("encoder future aborted");
+                debug!(self.log, "encoder future aborted");
+            }
         }
+    }
+
+    // TODO handle weirdness described here: https://github.com/joyent/node-zkstream/blob/fe7dadcfd59af3632302f807fad33e51f5b41be3/lib/zk-session.js#L497-L526
+    async fn reregister_watches(&mut self) -> Result<(), InternalError> {
+        let mut data = HashSet::new();
+        let mut exists = HashSet::new();
+        let mut children = HashSet::new();
+        for (path, watchlist) in self.watches.lock().unwrap().iter() {
+            for watch in watchlist {
+                let set = match watch.wtype {
+                    WatchType::Child => &mut children,
+                    WatchType::Data => &mut data,
+                    WatchType::Exist => &mut exists,
+                };
+                set.insert(path.clone());
+            }
+        }
+        if data.is_empty() && exists.is_empty() && children.is_empty() {
+            return Ok(());
+        }
+        let req = Request::SetWatches {
+            last_zxid_seen: self.sess_mgr.get_zxid().await,
+            data,
+            exists,
+            children,
+        };
+        let (tx, rx) = oneshot::channel();
+        self.req_tx.unbounded_send((req, tx))?;
+        rx.await??;
+        Ok(())
     }
 
     async fn run_decoder(
@@ -308,6 +371,7 @@ impl SharedState {
                     // Heartbeat interval elapsed without us having anything to
                     // send. Send a heartbeat!
                     //
+                    debug!(self.log, "Sending heartbeat");
                     if let Err(e) = encoder
                         .send(RequestWrapper {
                             xid: HEARTBEAT_XID,
@@ -315,7 +379,6 @@ impl SharedState {
                         })
                         .await
                     {
-                        println!("damn");
                         dec_abort_handle.abort();
                         return InternalError::from(e);
                     }
@@ -349,7 +412,6 @@ impl SharedState {
             }
             let new_xid = *xid_handle;
             *xid_handle += 1;
-
             debug!(self.log, "enqueueing request {:?}", request; "xid" => new_xid);
 
             //
@@ -371,15 +433,16 @@ impl SharedState {
                     ref mut watch,
                     ..
                 } => {
-                    if let Watch::Oneshot(_) = *watch {
+                    if let WatchOption::Oneshot(_) = *watch {
                         //
                         // Replace the request's watch field so we can use the
                         // Sender separately from the request below. It's safe
-                        // to replace with Watch::Global because all watch types
-                        // other than Watch::None are serialized identically.
+                        // to replace with WatchOption::Global because all watch
+                        // types other than WatchOption::None are serialized
+                        // identically.
                         //
-                        let w = mem::replace(watch, Watch::Global);
-                        if let Watch::Oneshot(w) = w {
+                        let w = mem::replace(watch, WatchOption::Global);
+                        if let WatchOption::Oneshot(tx) = w {
                             let wtype = match request {
                                 Request::GetData { .. } => WatchType::Data,
                                 Request::GetChildren { .. } => WatchType::Child,
@@ -388,7 +451,7 @@ impl SharedState {
                             };
                             debug!(
                                 self.log,
-                                "adding pending watcher";
+                                "adding pending watch";
                                 "xid" => new_xid,
                                 "path" => path,
                                 "wtype" => ?wtype
@@ -396,7 +459,7 @@ impl SharedState {
                             self.pending_watches
                                 .lock()
                                 .unwrap()
-                                .insert(new_xid, (path.to_string(), w, wtype));
+                                .insert(new_xid, (path.to_string(), Watch { wtype, tx }));
                         } else {
                             unreachable!();
                         }

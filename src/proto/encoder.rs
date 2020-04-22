@@ -6,6 +6,7 @@ use tokio_util::codec::Encoder;
 use crate::proto::decoder::HEADER_SIZE;
 use crate::proto::request::Request;
 
+#[derive(Debug)]
 pub(crate) struct RequestWrapper {
     pub(crate) req: Request,
     pub(crate) xid: i32,

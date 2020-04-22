@@ -1,9 +1,10 @@
 use bytes::{BufMut, BytesMut};
 use std::borrow::Cow;
+use std::collections::HashSet;
 
 use crate::error::ZkError;
 use crate::types::acl::Acl;
-use crate::types::watch::Watch;
+use crate::types::watch::WatchOption;
 use crate::types::CreateMode;
 
 #[derive(Debug)]
@@ -21,7 +22,7 @@ pub(crate) enum Request {
     },
     Exists {
         path: String,
-        watch: Watch,
+        watch: WatchOption,
     },
     Delete {
         path: String,
@@ -40,11 +41,11 @@ pub(crate) enum Request {
     },
     GetChildren {
         path: String,
-        watch: Watch,
+        watch: WatchOption,
     },
     GetData {
         path: String,
-        watch: Watch,
+        watch: WatchOption,
     },
     GetAcl {
         path: String,
@@ -57,6 +58,12 @@ pub(crate) enum Request {
     Check {
         path: String,
         version: i32,
+    },
+    SetWatches {
+        last_zxid_seen: i64,
+        data: HashSet<String>,
+        exists: HashSet<String>,
+        children: HashSet<String>,
     },
     Multi(Vec<Request>),
 }
@@ -159,10 +166,22 @@ impl WriteTo for u8 {
     }
 }
 
-impl WriteTo for str {
+//
+// XXX is there a way to avoid implementing WriteTo for both String and &String?
+//
+impl WriteTo for &String {
     fn write_to<B: BufMut>(&self, buf: &mut B) {
+        // TODO verify that this writes length, then str bytes, and nothing else.
         buf.put_i32(self.len() as i32);
-        buf.put(self.as_ref());
+        buf.put(self.as_str().as_ref());
+    }
+}
+
+impl WriteTo for String {
+    fn write_to<B: BufMut>(&self, buf: &mut B) {
+        // TODO verify that this writes length, then str bytes, and nothing else.
+        buf.put_i32(self.len() as i32);
+        buf.put(self.as_str().as_ref());
     }
 }
 
@@ -259,6 +278,17 @@ impl Request {
                 path.write_to(buffer);
                 buffer.put_i32(version);
             }
+            Request::SetWatches {
+                last_zxid_seen,
+                ref data,
+                ref exists,
+                ref children,
+            } => {
+                buffer.put_i64(last_zxid_seen);
+                write_list(buffer, &data.iter().collect::<Vec<&String>>());
+                write_list(buffer, &exists.iter().collect::<Vec<&String>>());
+                write_list(buffer, &children.iter().collect::<Vec<&String>>());
+            }
             Request::Multi(ref requests) => {
                 for r in requests {
                     MultiHeader::NextOk(r.opcode()).write_to(buffer);
@@ -282,6 +312,7 @@ impl Request {
             Request::GetAcl { .. } => OpCode::GetACL,
             Request::SetAcl { .. } => OpCode::SetACL,
             Request::Multi { .. } => OpCode::Multi,
+            Request::SetWatches { .. } => OpCode::SetWatches,
             Request::Check { .. } => OpCode::Check,
         }
     }

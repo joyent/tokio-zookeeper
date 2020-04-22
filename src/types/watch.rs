@@ -1,15 +1,15 @@
-use futures::channel::oneshot::Sender as OneshotSender;
+use futures::channel::oneshot::Sender;
 
 #[derive(Debug)]
-pub(crate) enum Watch {
+pub(crate) enum WatchOption {
     None,
     Global,
-    Oneshot(OneshotSender<WatchedEvent>),
+    Oneshot(Sender<WatchedEvent>),
 }
 
-impl Watch {
+impl WatchOption {
     pub(crate) fn to_u8(&self) -> u8 {
-        if let Watch::None = *self {
+        if let WatchOption::None = *self {
             0
         } else {
             1
@@ -26,6 +26,12 @@ pub(crate) enum WatchType {
     Data,
     /// Watching for the creation of a node at the given path.
     Exist,
+}
+
+#[derive(Debug)]
+pub(crate) struct Watch {
+    pub(crate) wtype: WatchType,
+    pub(crate) tx: Sender<WatchedEvent>,
 }
 
 /// Represents a change on the ZooKeeper that a `Watcher` is able to respond to.
