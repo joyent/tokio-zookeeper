@@ -170,14 +170,12 @@ impl Response {
                 bytes: reader.read_buffer()?,
                 stat: Stat::read_from(reader)?,
             }),
-            OpCode::Delete => Ok(Response::Empty),
             OpCode::GetChildren => Ok(Response::Strings(Vec::<String>::read_from(reader)?)),
             OpCode::Create => Ok(Response::String(reader.read_string()?)),
             OpCode::GetACL => Ok(Response::GetAcl {
                 acl: Vec::<Acl>::read_from(reader)?,
                 stat: Stat::read_from(reader)?,
             }),
-            OpCode::Check => Ok(Response::Empty),
             OpCode::Multi => {
                 let mut responses = Vec::new();
                 loop {
@@ -194,7 +192,9 @@ impl Response {
                 }
                 Ok(Response::Multi(responses))
             }
-            OpCode::SetWatches => Ok(Response::Empty),
+            OpCode::SetWatches | OpCode::CloseSession | OpCode::Delete | OpCode::Check => {
+                Ok(Response::Empty)
+            }
             _ => panic!("got unexpected response opcode {:?}", opcode),
         }
     }

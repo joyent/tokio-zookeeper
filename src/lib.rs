@@ -1,7 +1,7 @@
 //! This crate provides a client for interacting with [Apache
-//! ZooKeeper](https://zookeeper.apache.org/), a highly reliable distributed service for
-//! maintaining configuration information, naming, providing distributed synchronization, and
-//! providing group services.
+//! ZooKeeper](https://zookeeper.apache.org/), a highly reliable distributed
+//! service for maintaining configuration information, naming, providing
+//! distributed synchronization, and providing group services.
 //!
 //! # About ZooKeeper
 //!
@@ -59,10 +59,10 @@
 //! a node. A watch is one-time trigger that causes a [`WatchedEvent`] to be sent to the client
 //! that set the watch when the state for which the watch was set changes. For example, for a
 //! watched `get_data`, a one-time notification will be sent the first time the data of the target
-//! node changes following when the response to the original `get_data` call was processed. You
-//! should see the ["Watches" entry in the Programmer's
-//! Guide](https://zookeeper.apache.org/doc/current/zookeeperProgrammers.html#ch_zkWatches) for
-//! details.
+//! node changes following when the response to the original `get_data` call was
+//! processed. See the ["Watches" entry in the Programmer's
+//! Guide](https://zookeeper.apache.org/doc/current/zookeeperProgrammers.html#ch_zkWatches)
+//! for details.
 //!
 //! ## Getting started
 //!
@@ -77,7 +77,7 @@
 //! This library is analogous to the asynchronous API offered by the [official Java
 //! implementation](https://zookeeper.apache.org/doc/current/api/org/apache/zookeeper/ZooKeeper.html),
 //! and for most operations the Java documentation should apply to the Rust implementation. If this
-//! is not the case, it is considered [a bug](https://github.com/jonhoo/tokio-zookeeper/issues),
+//! is not the case, it is considered [a bug](https://github.com/joyent/tokio-zookeeper/issues),
 //! and we'd love a bug report with as much relevant information as you can offer.
 //!
 //! Note that since this implementation is asynchronous, users of the client must take care to
@@ -93,127 +93,15 @@
 //!
 //! ## Interaction with Tokio
 //!
-//! The futures in this crate expect to be running under a `tokio::Runtime`. In the common case,
-//! you cannot resolve them solely using `.wait()`, but should instead use `tokio::run` or
-//! explicitly create a `tokio::Runtime` and then use `Runtime::block_on`.
+//! The futures in this crate expect to be running under a `tokio::Runtime`.
+//! Within that context, you can `await` them.
 //!
 //! # A somewhat silly example
 //!
 //! ```no_run
-//! use failure::format_err;
-//! use tokio_zookeeper::*;
-//! use tokio::prelude::*;
-//!
-//! # fn main() {
-//! tokio::run(
-//!     ZooKeeper::connect(&"127.0.0.1:2181".parse().unwrap())
-//!         .and_then(|(zk, default_watcher)| {
-//!             // let's first check if /example exists. the .watch() causes us to be notified
-//!             // the next time the "exists" status of /example changes after the call.
-//!             zk.watch()
-//!                 .exists("/example")
-//!                 .inspect(|(_, stat)| {
-//!                     // initially, /example does not exist
-//!                     assert_eq!(stat, &None)
-//!                 })
-//!                 .and_then(|(zk, _)| {
-//!                     // so let's make it!
-//!                     zk.create(
-//!                         "/example",
-//!                         &b"Hello world"[..],
-//!                         Acl::open_unsafe(),
-//!                         CreateMode::Persistent,
-//!                     )
-//!                 })
-//!                 .inspect(|(_, ref path)| {
-//!                     assert_eq!(path.as_ref().map(String::as_str), Ok("/example"))
-//!                 })
-//!                 .and_then(|(zk, _)| {
-//!                     // does it exist now?
-//!                     zk.watch().exists("/example")
-//!                 })
-//!                 .inspect(|(_, stat)| {
-//!                     // looks like it!
-//!                     // note that the creation above also triggered our "exists" watch!
-//!                     assert_eq!(stat.unwrap().data_length as usize, b"Hello world".len())
-//!                 })
-//!                 .and_then(|(zk, _)| {
-//!                     // did the data get set correctly?
-//!                     zk.get_data("/example")
-//!                 })
-//!                 .inspect(|(_, res)| {
-//!                     let data = b"Hello world";
-//!                     let res = res.as_ref().unwrap();
-//!                     assert_eq!(res.0, data);
-//!                     assert_eq!(res.1.data_length as usize, data.len());
-//!                 })
-//!                 .and_then(|(zk, res)| {
-//!                     // let's update the data.
-//!                     zk.set_data("/example", Some(res.unwrap().1.version), &b"Bye world"[..])
-//!                 })
-//!                 .inspect(|(_, stat)| {
-//!                     assert_eq!(stat.unwrap().data_length as usize, "Bye world".len());
-//!                 })
-//!                 .and_then(|(zk, _)| {
-//!                     // create a child of /example
-//!                     zk.create(
-//!                         "/example/more",
-//!                         &b"Hello more"[..],
-//!                         Acl::open_unsafe(),
-//!                         CreateMode::Persistent,
-//!                     )
-//!                 })
-//!                 .inspect(|(_, ref path)| {
-//!                     assert_eq!(path.as_ref().map(String::as_str), Ok("/example/more"))
-//!                 })
-//!                 .and_then(|(zk, _)| {
-//!                     // it should be visible as a child of /example
-//!                     zk.get_children("/example")
-//!                 })
-//!                 .inspect(|(_, children)| {
-//!                     assert_eq!(children, &Some(vec!["more".to_string()]));
-//!                 })
-//!                 .and_then(|(zk, _)| {
-//!                     // it is not legal to delete a node that has children directly
-//!                     zk.delete("/example", None)
-//!                 })
-//!                 .inspect(|(_, res)| assert_eq!(res, &Err(error::Delete::NotEmpty)))
-//!                 .and_then(|(zk, _)| {
-//!                     // instead we must delete the children first
-//!                     zk.delete("/example/more", None)
-//!                 })
-//!                 .inspect(|(_, res)| assert_eq!(res, &Ok(())))
-//!                 .and_then(|(zk, _)| zk.delete("/example", None))
-//!                 .inspect(|(_, res)| assert_eq!(res, &Ok(())))
-//!                 .and_then(|(zk, _)| {
-//!                     // no /example should no longer exist!
-//!                     zk.exists("/example")
-//!                 })
-//!                 .inspect(|(_, stat)| assert_eq!(stat, &None))
-//!                 .and_then(move |(zk, _)| {
-//!                     // now let's check that the .watch().exists we did in the very
-//!                     // beginning actually triggered!
-//!                     default_watcher
-//!                         .into_future()
-//!                         .map(move |x| (zk, x))
-//!                         .map_err(|e| format_err!("stream error: {:?}", e.0))
-//!                 })
-//!                 .inspect(|(_, (event, _))| {
-//!                     assert_eq!(
-//!                         event,
-//!                         &Some(WatchedEvent {
-//!                             event_type: WatchedEventType::NodeCreated,
-//!                             keeper_state: KeeperState::SyncConnected,
-//!                             path: String::from("/example"),
-//!                         })
-//!                     );
-//!                 })
-//!         })
-//!         .map(|_| ())
-//!         .map_err(|e| panic!("{:?}", e)),
-//! );
-//! # }
+//! TODO write an example
 //! ```
+//!
 
 #![allow(missing_docs)]
 #![deny(missing_debug_implementations)]
@@ -227,10 +115,12 @@ pub mod types;
 pub(crate) mod session_manager;
 pub(crate) mod state;
 
+use clap::{crate_name, crate_version};
 use failure::{bail, format_err};
 use futures::channel::mpsc::{self, UnboundedReceiver};
 use futures::channel::oneshot::{self, Receiver};
-use slog::{o, trace};
+use slog::{o, trace, Drain, LevelFilter};
+use slog_async::Async;
 use std::borrow::Cow;
 use std::net::SocketAddr;
 use std::time;
@@ -290,8 +180,16 @@ pub struct ZooKeeperBuilder {
 
 impl Default for ZooKeeperBuilder {
     fn default() -> Self {
-        let drain = slog::Discard;
-        let root = slog::Logger::root(drain, o!());
+        let drain = Async::new(
+            LevelFilter::new(
+                slog_bunyan::with_name(crate_name!(), std::io::stdout()).build(),
+                slog::Level::Info,
+            )
+            .fuse(),
+        )
+        .build()
+        .fuse();
+        let root = slog::Logger::root(drain, o!("build-id" => crate_version!()));
 
         ZooKeeperBuilder {
             //
@@ -322,23 +220,19 @@ impl ZooKeeperBuilder {
     /// attempt to reconnect until the session timeout expires. Only then should
     /// the application call connect() again.
     ///
-    pub async fn connect(
-        self,
-        addr: &SocketAddr,
-    ) -> Result<(ZooKeeper, UnboundedReceiver<WatchedEvent>), failure::Error> {
+    pub async fn connect(self, addr: &SocketAddr) -> (ZooKeeper, UnboundedReceiver<WatchedEvent>) {
         let addr = *addr;
         let log = self.logger.clone();
         let (tx, rx) = mpsc::unbounded();
         let enqueuer =
             SharedState::start(addr, tx, self.session_timeout, self.read_only, log).await;
-        Ok((
+        (
             ZooKeeper {
                 connection: enqueuer,
                 logger: self.logger,
             },
             rx,
-        ))
-        // TODO should this function ever return an error?
+        )
     }
 
     ///
@@ -355,8 +249,8 @@ impl ZooKeeperBuilder {
     ///
     /// Set the logger that should be used internally in the ZooKeeper client.
     ///
-    /// By default, all logging is disabled. See also [the `slog`
-    /// documentation](https://docs.rs/slog).
+    /// By default, the log level is set to `Info` and logs are written to
+    /// stdout.See also [the `slog` documentation](https://docs.rs/slog).
     ///
     pub fn set_logger(&mut self, l: slog::Logger) {
         self.logger = l;
@@ -369,13 +263,10 @@ impl ZooKeeper {
     ///
     /// See [`ZooKeeperBuilder::connect`].
     ///
-    pub async fn connect(
-        addr: &SocketAddr,
-    ) -> Result<(Self, UnboundedReceiver<WatchedEvent>), failure::Error> {
+    pub async fn connect(addr: &SocketAddr) -> (Self, UnboundedReceiver<WatchedEvent>) {
         ZooKeeperBuilder::default().connect(addr).await
     }
 
-    /// TODO do some return-type error-flattening for methods like this one?
     ///
     /// Create a node with the given `path` with `data` as its contents.
     ///

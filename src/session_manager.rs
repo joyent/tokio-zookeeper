@@ -1,9 +1,11 @@
 use backoff::backoff::Backoff;
 use backoff::ExponentialBackoff;
+use futures::channel::mpsc::UnboundedSender;
+use futures::channel::oneshot::{self, Sender};
 use futures::lock::Mutex as AsyncMutex;
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
-use slog::{error, info, trace, Logger};
+use slog::{debug, error, info, trace, Logger};
 use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,7 +15,7 @@ use tokio::net::TcpStream;
 use tokio::time;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
-use crate::error::InternalError;
+use crate::error::{InternalError, ZkError};
 use crate::proto::decoder::ZkConnDecoder;
 use crate::proto::encoder::{RequestWrapper, ZkEncoder};
 use crate::proto::request::Request;
@@ -78,27 +80,6 @@ impl SessionInfo {
     }
 }
 
-// #[derive(Debug, PartialEq)]
-// enum SessionState {
-//     Connecting { first: bool },
-//     Connected,
-//     Closed,
-//     AuthFailed,
-// }
-
-// #[derive(Debug)]
-// enum SessionEvent {
-//     Connected,
-//     Disconnected,
-//     CloseCalled,
-//     SessionExpired,
-//     AuthFailed,
-// }
-
-// struct StateMachine {
-//     state: SessionState,
-// }
-
 // TODO shutdown stream on cleanup
 
 #[derive(Clone, Debug)]
@@ -108,6 +89,10 @@ pub(crate) struct SessionManager {
     /// Next xid to issue
     ///
     xid: Arc<AsyncMutex<i32>>,
+    ///
+    /// Clone of client-facing tx to let us send server requests internally
+    ///
+    req_tx: UnboundedSender<(Request, Sender<Result<Response, ZkError>>)>,
     session_info: Arc<AsyncMutex<SessionInfo>>,
     first: Arc<AsyncMutex<bool>>,
     exited: Arc<AsyncMutex<bool>>,
@@ -119,6 +104,7 @@ impl SessionManager {
     pub(crate) fn new(
         addr: SocketAddr,
         xid: Arc<AsyncMutex<i32>>,
+        req_tx: UnboundedSender<(Request, Sender<Result<Response, ZkError>>)>,
         session_timeout: Duration,
         read_only: bool,
         log: Logger,
@@ -126,6 +112,7 @@ impl SessionManager {
         SessionManager {
             addr,
             xid,
+            req_tx,
             session_info: Arc::new(AsyncMutex::new(SessionInfo::new(
                 session_timeout,
                 read_only,
@@ -136,23 +123,6 @@ impl SessionManager {
             log,
         }
     }
-
-    // // TODO make sure we call this everywhere we need to
-    // async fn set_next_state(&self, event: SessionEvent) {
-    //     let mut state = self.state.lock().await;
-    //     let next = match (&*state, event) {
-    //         (SessionState::Connecting { .. }, SessionEvent::Connected) => SessionState::Connected,
-    //         (SessionState::Connecting { .. }, SessionEvent::SessionExpired) => SessionState::Closed,
-    //         (SessionState::Connecting { .. }, SessionEvent::CloseCalled) => SessionState::Closed,
-    //         (SessionState::Connecting { .. }, SessionEvent::AuthFailed) => SessionState::AuthFailed,
-    //         (SessionState::Connected, SessionEvent::Disconnected) => {
-    //             SessionState::Connecting { first: false }
-    //         }
-    //         (SessionState::Connected, SessionEvent::CloseCalled) => SessionState::Closed,
-    //         (s, e) => panic!("Invalid SessionState/SessionEvent pair: {:?}, {:?}", s, e),
-    //     };
-    //     *state = next;
-    // }
 
     pub(crate) async fn reconnect(
         &self,
@@ -169,9 +139,6 @@ impl SessionManager {
                 //
                 // If the session timeout has elapsed, we can't possibly
                 // reconnect.
-                // TODO what happens if we send a connect request for a blatantly expired
-                // session? Make sure that edge case doesn't cause problems, just in case it
-                // happens.
                 //
                 // TODO implement stability threshold for backoff?
                 //
@@ -179,8 +146,14 @@ impl SessionManager {
                 Some(Duration::from_millis(session_info.timeout as u64))
             }
         };
+        info!(self.log, "Connecting");
         let mut delay = Duration::from_millis(0);
         loop {
+            debug!(
+                self.log,
+                "Attempting to connect";
+                "delay_ms" => delay.as_millis()
+            );
             time::delay_for(delay).await;
             match self.reconnect_inner().await {
                 Err(e) => {
@@ -193,7 +166,10 @@ impl SessionManager {
                             delay = interval;
                             continue;
                         }
-                        None => return Err(InternalError::ReconnectTimeout),
+                        //
+                        // The max time before session expiry elapsed
+                        //
+                        None => return Err(InternalError::SessionExpired),
                     }
                 }
                 Ok(result) => {
@@ -215,10 +191,6 @@ impl SessionManager {
                 None => Err(InternalError::ConnectionEnded),
             }
         }
-        println!(
-            "Reconnecting; current time is: {:?}",
-            std::time::SystemTime::now()
-        );
 
         let request = {
             let session_info = self.session_info.lock().await;
@@ -294,9 +266,13 @@ impl SessionManager {
         (*self.session_info.lock().await).heartbeat_interval
     }
 
-    pub(crate) async fn close_session(&self) {
-        // TODO implement this
+    pub(crate) async fn close_session(&self) -> Result<(), InternalError> {
         *self.exited.lock().await = true;
+        let req = Request::Close;
+        let (tx, rx) = oneshot::channel();
+        self.req_tx.unbounded_send((req, tx))?;
+        rx.await??;
+        Ok(())
     }
 
     pub(crate) async fn set_zxid(&self, zxid: i64) {
@@ -330,5 +306,3 @@ impl SessionManager {
         *self.last_contact.lock().await = Instant::now();
     }
 }
-
-// TODO go through and replace all mutexes with asyncmutexes where possible

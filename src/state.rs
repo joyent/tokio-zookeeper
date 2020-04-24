@@ -6,13 +6,11 @@ use futures::{
         mpsc::{self, UnboundedReceiver, UnboundedSender},
         oneshot::{self, Sender},
     },
-    executor,
     future::{AbortHandle, Abortable},
     lock::Mutex as AsyncMutex,
     sink::SinkExt,
     stream::StreamExt,
 };
-use slog;
 use slog::{debug, error, info, Logger};
 use std::collections::{HashMap, HashSet};
 use std::mem;
@@ -21,7 +19,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use tokio::io::{ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
-use tokio::sync::Barrier;
+use tokio::sync::{Barrier, Notify};
 use tokio::time;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
@@ -37,9 +35,9 @@ use crate::session_manager::SessionManager;
 use crate::types::watch::{Watch, WatchOption, WatchType, WatchedEvent};
 
 //
-// This struct exists so the enqueuer can have a handle to the client's
+// This struct exists so the enqueuer can communicate with the client's
 // background tasks. When the enqueuer is dropped, this struct is dropped, and
-// its drop() method ends the session and kills the background tasks.
+// its drop() method notifies the client to close the session and exit.
 //
 // Note that, while all of this struct's members are Clone, this struct
 // **is not Clone**. The user may clone Enqueuers, and we want all of them to
@@ -48,20 +46,19 @@ use crate::types::watch::{Watch, WatchOption, WatchType, WatchedEvent};
 //
 #[derive(Debug)]
 struct TaskTracker {
-    abort_handles: Arc<Mutex<Option<(AbortHandle, AbortHandle)>>>,
-    sess_mgr: SessionManager,
+    notify: Arc<Notify>,
+    log: Logger,
 }
 
 impl Drop for TaskTracker {
     fn drop(&mut self) {
-        println!("aborting!");
-        if let Some((h1, h2)) = &*self.abort_handles.lock().unwrap() {
-            h1.abort();
-            h2.abort();
-        }
-        println!("aborted");
-        executor::block_on(self.sess_mgr.close_session());
-        println!("drop finished");
+        //
+        // We have to do this before aborting the encoder/decoder so the run()
+        // loop notices that we've exited instead of starting the encoder
+        // and decoder again.
+        //
+        info!(self.log, "Enqueuer dropped");
+        self.notify.notify();
     }
 }
 
@@ -127,43 +124,91 @@ impl SharedState {
         let sess_mgr = SessionManager::new(
             addr,
             Arc::clone(&xid),
+            tx.clone(),
             session_timeout,
             read_only,
             log.clone(),
         );
-        // TODO explain this nested arc stuff
-        let abort_handles = Arc::new(Mutex::new(None));
+
+        let abort_handles: Arc<AsyncMutex<Option<(AbortHandle, AbortHandle)>>> =
+            Arc::new(AsyncMutex::new(None));
+        let notify = Arc::new(Notify::new());
         let enqueuer = Enqueuer {
             tx: tx.clone(),
             task_tracker: Arc::new(TaskTracker {
-                abort_handles: Arc::clone(&abort_handles),
-                sess_mgr: sess_mgr.clone(),
+                notify: Arc::clone(&notify),
+                log: log.clone(),
             }),
         };
+
+        let rx = Arc::new(AsyncMutex::new(rx));
+        let rx_clone = Arc::clone(&rx);
+        let replies = Arc::new(Mutex::new(HashMap::new()));
+        let replies_clone = Arc::clone(&replies);
+        let watches = Arc::new(Mutex::new(HashMap::new()));
+        let watches_clone = Arc::clone(&watches);
+
+        let cleanup_sess_mgr = sess_mgr.clone();
+        let cleanup_abort_handles = abort_handles.clone();
+        let cleanup_log = log.clone();
+        let cleanup_task = tokio::task::spawn(async move {
+            notify.notified().await;
+            //
+            // If this fails, there's really nothing we can do. We were going to
+            // exit anyway.
+            //
+            if let Err(e) = cleanup_sess_mgr.close_session().await {
+                error!(cleanup_log, "Error closing session; ignoring: {:?}", e);
+            }
+            if let Some((h1, h2)) = &*cleanup_abort_handles.lock().await {
+                info!(cleanup_log, "aborting encoder/decoder tasks");
+                h1.abort();
+                h2.abort();
+            }
+        });
 
         tokio::task::spawn(async move {
             let mut s = SharedState {
                 xid,
                 req_tx: tx,
-                rx: Arc::new(AsyncMutex::new(rx)),
+                rx,
                 log: log.clone(),
                 sess_mgr,
-                replies: Arc::new(Mutex::new(HashMap::new())),
+                replies,
                 pending_watches: Arc::new(Mutex::new(HashMap::new())),
-                watches: Arc::new(Mutex::new(HashMap::new())),
+                watches,
                 default_watcher,
                 addr,
             };
             match s.run(bg_barrier, abort_handles).await {
-                // TODO destroy watches so any waiting channels resolve with
-                // error
                 Err(e) => error!(log, "Client exiting with error: {:?}", e),
                 Ok(_) => info!(log, "Client exiting"),
             }
+            //
+            // We need to clear the waiting-reply map and close the request
+            // channel before we exit so any inflight requests sent using req_tx
+            // (e.g. reregister_watches, close_session) get canceled and any new
+            // requests sent using req_tx fail. We need to make sure this
+            // happens so all associated threads exit and any SharedState
+            // references get dropped, ensuring proper shutdown.
+            //
+            replies_clone.lock().unwrap().clear();
+            rx_clone.lock().await.close();
+            //
+            // We clear this too just in case we've issued a request internally
+            // that has set a watch and is waiting on it, so that watch
+            // resolves and any SharedState references get dropped. We don't
+            // issue such requests in the code right now, but we might in the
+            // future.
+            //
+            watches_clone.lock().unwrap().clear();
+            //
+            // This will probably have run by now but we wait as a formality.
+            //
+            cleanup_task.await.expect("cleanup task panicked");
+            info!(log, "Client exited");
         });
         barrier.wait().await;
-
-        // TODO should this function ever return an error?
 
         enqueuer
     }
@@ -171,7 +216,7 @@ impl SharedState {
     async fn run(
         &mut self,
         barrier: Arc<Barrier>,
-        abort_handles: Arc<Mutex<Option<(AbortHandle, AbortHandle)>>>,
+        abort_handles: Arc<AsyncMutex<Option<(AbortHandle, AbortHandle)>>>,
     ) -> Result<(), InternalError> {
         let mut first = true;
         loop {
@@ -182,18 +227,7 @@ impl SharedState {
             //
             // If we really can't reconnect, we have no choice but to exit.
             //
-            let (tx, rx) = self.sess_mgr.reconnect().await.map_err(|e| {
-                //
-                // We need to clear these before we exit so any inflight
-                // requests sent using req_tx (e.g. reregister_watches) get
-                // canceled. We need to make sure they get canceled so all
-                // associated threads exit and the SharedState gets dropped,
-                // ensuring proper shutdown.
-                //
-                self.replies.lock().unwrap().clear();
-                self.pending_watches.lock().unwrap().clear();
-                e
-            })?;
+            let (tx, rx) = self.sess_mgr.reconnect().await?;
 
             //
             // Allow the initial call to start() to resolve
@@ -214,8 +248,6 @@ impl SharedState {
                     }
                 });
             }
-            // TODO I will have to think about a lot of edge cases with interrupted
-            // reconnect loop state probably
 
             let mut enc_state = self.clone();
             let mut dec_state = self.clone();
@@ -224,7 +256,7 @@ impl SharedState {
             let (dec_abort_handle, dec_abort_registration) = AbortHandle::new_pair();
 
             {
-                let mut abort_handles = abort_handles.lock().unwrap();
+                let mut abort_handles = abort_handles.lock().await;
                 *abort_handles = Some((enc_abort_handle.clone(), dec_abort_handle.clone()));
             }
 
@@ -251,22 +283,28 @@ impl SharedState {
             // having them fine-grained abort each other? Not sure if that
             // would work ok.
             if let Ok(e) = dec_task_handle.await {
-                println!("Decoder error: {:?}", e);
                 error!(self.log, "Decoder error: {:?}", e);
             } else {
-                println!("decoder future aborted");
                 debug!(self.log, "decoder future aborted");
             }
             if let Ok(e) = enc_task_handle.await {
-                println!("Encoder error: {:?}", e);
                 error!(self.log, "Encoder error: {:?}", e);
             } else {
-                println!("encoder future aborted");
                 debug!(self.log, "encoder future aborted");
+            }
+
+            {
+                let mut abort_handles = abort_handles.lock().await;
+                *abort_handles = None;
             }
         }
     }
 
+    // TODO node-zkstream does some interesting dedup when reregistering watches.
+    // Should we be doing that too?
+    // TODO figure out why watching for the existence of a node that does exist,
+    // then reconnecting and reregistering watches causes a "create" event to
+    // get sent even though the node already existed
     // TODO handle weirdness described here: https://github.com/joyent/node-zkstream/blob/fe7dadcfd59af3632302f807fad33e51f5b41be3/lib/zk-session.js#L497-L526
     async fn reregister_watches(&mut self) -> Result<(), InternalError> {
         let mut data = HashSet::new();
@@ -317,6 +355,7 @@ impl SharedState {
                         //
                         // TODO I'm not sure that these should ever happen --
                         // should we panic instead in decoder if they do?
+                        //
                         Err(e) => error!(log, "Server Error; doing nothing: {:?}", e),
                         Ok(zxid) => sess_mgr.set_zxid(zxid).await,
                     }
@@ -386,33 +425,26 @@ impl SharedState {
                 }
                 Ok(tuple) => {
                     tuple.expect("internal enqueuer rx dropped")
-                    //
-                    // TODO I'm not sure if this is right
-                    // The user dropped the handle to zk.
-                    // TODO mark client for shutdown once there are no watches
-                    // left. Or, just shut it down immediately -- who is
-                    // going to drop the zk handle but keep a watch handle
-                    // around?
                     // TODO make sure to send closesession before shutting down
-                    //
-                    // info!(self.log, "ZK handle dropped; client exiting");
-
-                    // dec_abort_handle.abort();
-                    // return;
                 }
             };
 
-            let mut xid_handle = self.xid.lock().await;
-            // Skip special xids
-            while *xid_handle == SHUTDOWN_XID
-                || *xid_handle == WATCH_XID
-                || *xid_handle == HEARTBEAT_XID
-            {
+            let new_xid = if let Request::Close = request {
+                SHUTDOWN_XID
+            } else {
+                let mut xid_handle = self.xid.lock().await;
+                // Skip special xids
+                while *xid_handle == SHUTDOWN_XID
+                    || *xid_handle == WATCH_XID
+                    || *xid_handle == HEARTBEAT_XID
+                {
+                    *xid_handle += 1;
+                }
+                let new_xid = *xid_handle;
                 *xid_handle += 1;
-            }
-            let new_xid = *xid_handle;
-            *xid_handle += 1;
-            debug!(self.log, "enqueueing request {:?}", request; "xid" => new_xid);
+                new_xid
+            };
+            info!(self.log, "enqueueing request {:?}", request; "xid" => new_xid);
 
             //
             // Register a watch, if necessary
@@ -479,8 +511,10 @@ impl SharedState {
                 assert!(old.is_none());
             };
 
+            //
             // XXX we should really send this in the background but then we have
             // to handle encoder lifetime/ownership. Blah!
+            //
             if let Err(e) = encoder
                 .send(RequestWrapper {
                     xid: new_xid,
@@ -494,48 +528,6 @@ impl SharedState {
         }
     }
 }
-
-// impl<S> Future for Packetizer<S>
-// where
-//     S: ZooKeeperTransport,
-// {
-//     type Output = Result<(), failure::Error>;
-
-//     fn poll(&mut self) -> Poll<Self::Output> {
-//         trace!(self.logger, "packetizer polled");
-//         if !self.exiting {
-//             trace!(self.logger, "poll_enqueue");
-//             match self.poll_enqueue() {
-//                 Ok(_) => {}
-//                 Err(()) => {
-//                     // no more requests will be enqueued
-//                     self.exiting = true;
-
-//                     if let PacketizerState::Connected(ref mut ap) = self.state {
-//                         // send CloseSession
-//                         // length is fixed
-//                         ap.outbox
-//                             .write_i32::<BigEndian>(8)
-//                             .expect("Vec::write should never fail");
-//                         // xid
-//                         ap.outbox
-//                             .write_i32::<BigEndian>(0)
-//                             .expect("Vec::write should never fail");
-//                         // opcode
-//                         ap.outbox
-//                             .write_i32::<BigEndian>(request::OpCode::CloseSession as i32)
-//                             .expect("Vec::write should never fail");
-//                     } else {
-//                         unreachable!("poll_enqueue will never return Err() if not connected");
-//                     }
-//                 }
-//             }
-//         }
-
-//         self.state
-//             .poll(self.exiting, &mut self.logger, &mut self.default_watcher)
-//     }
-// }
 
 #[derive(Clone, Debug)]
 pub(crate) struct Enqueuer {

@@ -10,7 +10,7 @@ use tokio_util::codec::Decoder;
 
 use crate::error::{InternalError, ZkError};
 use crate::proto::request::{self, OpCode};
-use crate::proto::response::{ReadFrom, Response, HEARTBEAT_XID, SHUTDOWN_XID, WATCH_XID};
+use crate::proto::response::{ReadFrom, Response, HEARTBEAT_XID, WATCH_XID};
 use crate::types::watch::{Watch, WatchType, WatchedEvent, WatchedEventType};
 
 //
@@ -19,8 +19,11 @@ use crate::types::watch::{Watch, WatchType, WatchedEvent, WatchedEventType};
 // message.
 //
 pub const HEADER_SIZE: usize = 4;
-
-// TODO pick between std mutex and futures mutex and only use one
+//
+// All (non-connect) responses will have at least an xid (i32), zxid (i64), and
+// error (i32).
+//
+const MINIMUM_RESPONSE_SIZE: usize = HEADER_SIZE + 4 + 8 + 4;
 
 pub(crate) struct ZkDecoder {
     ///
@@ -74,7 +77,10 @@ impl ZkDecoder {
 // We should still get rid of the regular mutexes, though.
 
 impl Decoder for ZkDecoder {
-    // The result is the zxid of the encoded message
+    //
+    // The result is the zxid of the decoded message for use by the
+    // SessionManager.
+    //
     type Item = Result<i64, InternalError>;
     //
     // This is for unrecoverable errors.
@@ -83,7 +89,6 @@ impl Decoder for ZkDecoder {
     //
     type Error = IoError;
 
-    // TODO refactor this big boy function
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
         fn wrap<T, E>(item: T) -> Result<Option<T>, E> {
             Ok(Some(item))
@@ -97,8 +102,7 @@ impl Decoder for ZkDecoder {
 
         // See if we've received the message length yet
         if buf.len() < HEADER_SIZE {
-            // TODO figure out the minimum message length and optimize the reservation more?
-            src.reserve(HEADER_SIZE);
+            src.reserve(MINIMUM_RESPONSE_SIZE);
             return Ok(None);
         }
 
@@ -117,8 +121,6 @@ impl Decoder for ZkDecoder {
         let xid = buf.read_i32::<BigEndian>()?;
         let zxid = buf.read_i64::<BigEndian>()?;
 
-        // self.handle_new_zxid(zxid);
-
         // Deserialize error
         let zk_err: ZkError = buf.read_i32::<BigEndian>()?.into();
         if zk_err != ZkError::Ok {
@@ -129,21 +131,26 @@ impl Decoder for ZkDecoder {
         // Response to shutdown. The response is empty beyond the xid/zxid/err.
         // In theory, the server should now shut down its end of the connection.
         //
-        if xid == SHUTDOWN_XID {
-            trace!(self.log, "got response to CloseSession");
-            if let Some(e) = err {
-                src.advance(msg_len + HEADER_SIZE);
-                return wrap(Err(InternalError::ServerError(e)));
-            }
-        //
-        // A watch has triggered.
-        //
-        } else if xid == WATCH_XID {
-            // TODO make sure we set the session state based on the event
+        // if xid == SHUTDOWN_XID {
+        //     debug!(self.log, "got response to CloseSession");
+        //     if let Some(e) = err {
+        //         src.advance(msg_len + HEADER_SIZE);
+        //         return wrap(Err(InternalError::ServerError(e)));
+        //     }
+        // //
+        // // A watch has triggered.
+        // //
+        // } else
+        if xid == WATCH_XID {
             // Deserialize the WatchedEvent
             let e = WatchedEvent::read_from(&mut buf)?;
-            println!("watch event received: {:?}", e);
-            trace!(self.log, "got watch event {:?}", e);
+            debug!(self.log, "got watch event {:?}", e);
+            //
+            // Isaac contends that the server never sends state events;
+            // the client must create these itself. If this assert fails, Isaac
+            // is wrong and we have to handle those events here!
+            //
+            assert!(e.event_type != WatchedEventType::None);
 
             let mut watches = self.watches.lock().unwrap();
             let mut remove_watch_list = false;
@@ -162,8 +169,7 @@ impl Decoder for ZkDecoder {
                 //
                 // We iterate in reverse so we can safely use swap_remove() for
                 // removal from the Vec, knowing that we've already iterated
-                // over the last element in the Vec. This is pretty optimize-y.
-                // Is it worth doing? (TODO)
+                // over the last element in the Vec.
                 //
                 for i in (0..watch_list.len()).rev() {
                     let watch_matched = match (watch_list[i].wtype, e.event_type) {
@@ -231,7 +237,7 @@ impl Decoder for ZkDecoder {
             let (opcode, tx) = match self.replies.lock().unwrap().remove(&xid) {
                 Some(tuple) => tuple,
                 None => {
-                    // TODO what to do here? Should this ever happen?
+                    // TODO Should this ever happen?
                     src.advance(msg_len + HEADER_SIZE);
                     return wrap(Err(InternalError::DanglingXid(xid)));
                 }
@@ -240,10 +246,6 @@ impl Decoder for ZkDecoder {
             //
             // If the request tried to set a watch, we confirm that the request
             // has succeeded and register the watch if so.
-            //
-            // TODO do we leak pending watches somehow if a request gets interrupted?
-            // I think we don't, assuming we clear all pending watches upon reconnect,
-            // because an interrupted request will always trigger a reconnect. I'm not sure.
             //
             if let Some((path, watch)) = self.pending_watches.lock().unwrap().remove(&xid) {
                 //
@@ -297,14 +299,8 @@ impl Decoder for ZkDecoder {
             }
         }
         src.advance(msg_len + HEADER_SIZE);
-        // Set aside space for the next frame (TODO optimize for minimum actual frame size?)
-        src.reserve(HEADER_SIZE);
+        src.reserve(MINIMUM_RESPONSE_SIZE);
         wrap(Ok(zxid))
-
-        // TODO add logging everywhere; uncomment existing log lines
-
-        // TODO write a comment explaining all the various nested errors and control flow here
-        // TODO handle keeperstate somehow? Not sure tbh
     }
 }
 
@@ -326,7 +322,6 @@ impl Decoder for ZkConnDecoder {
 
         // See if we've received the message length yet
         if buf.len() < HEADER_SIZE {
-            // TODO figure out the minimum message length and optimize the reservation more?
             src.reserve(HEADER_SIZE);
             return Ok(None);
         }

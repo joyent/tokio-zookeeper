@@ -13,12 +13,9 @@ pub enum InternalError {
     /// A server error to be handled internally.
     ///
     ServerError(ZkError),
-    /// TODO do we need this?
     DanglingXid(i32),
     ConnectionError(IoError),
     ConnectionEnded,
-    // TODO maybe we should just always use SessionExpired and get rid of ReconnectTimeout
-    ReconnectTimeout,
     SessionExpired,
 }
 

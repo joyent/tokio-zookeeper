@@ -10,9 +10,8 @@ use crate::types::CreateMode;
 #[derive(Debug)]
 pub(crate) enum Request {
     Ping,
+    Close,
     Connect {
-        // TODO make sure (here and elsewhere) that the signedness of the fields
-        // matches the signedness expected by the server
         protocol_version: i32,
         last_zxid_seen: i64,
         timeout: i32,
@@ -171,7 +170,6 @@ impl WriteTo for u8 {
 //
 impl WriteTo for &String {
     fn write_to<B: BufMut>(&self, buf: &mut B) {
-        // TODO verify that this writes length, then str bytes, and nothing else.
         buf.put_i32(self.len() as i32);
         buf.put(self.as_str().as_ref());
     }
@@ -179,7 +177,6 @@ impl WriteTo for &String {
 
 impl WriteTo for String {
     fn write_to<B: BufMut>(&self, buf: &mut B) {
-        // TODO verify that this writes length, then str bytes, and nothing else.
         buf.put_i32(self.len() as i32);
         buf.put(self.as_str().as_ref());
     }
@@ -206,7 +203,7 @@ where
 impl Request {
     pub(super) fn serialize_into(&self, buffer: &mut BytesMut) {
         match *self {
-            Request::Ping => {}
+            Request::Ping | Request::Close => {}
             Request::Connect {
                 protocol_version,
                 last_zxid_seen,
@@ -302,6 +299,7 @@ impl Request {
     pub(crate) fn opcode(&self) -> OpCode {
         match *self {
             Request::Ping => OpCode::Ping,
+            Request::Close => OpCode::CloseSession,
             Request::Connect { .. } => OpCode::CreateSession,
             Request::Exists { .. } => OpCode::Exists,
             Request::Delete { .. } => OpCode::Delete,

@@ -54,6 +54,7 @@ pub struct WatchedEvent {
 #[repr(i32)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeeperState {
+    // TODO send these over the default watcher as appropriate
     /// The client is in the disconnected state - it is not connected to any server in the ensemble.
     Disconnected = 0,
     /// The client is in the connected state - it is connected to a server in the ensemble (one of
@@ -95,7 +96,6 @@ impl From<i32> for KeeperState {
 pub enum WatchedEventType {
     /// Nothing known has occurred on the znode. This value is issued as part of a `WatchedEvent`
     /// when the `KeeperState` changes.
-    /// TODO test that these come through
     None = -1,
     /// Issued when a znode at a given path is created.
     NodeCreated = 1,
