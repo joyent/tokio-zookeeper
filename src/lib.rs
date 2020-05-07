@@ -116,7 +116,6 @@ pub(crate) mod session_manager;
 pub(crate) mod transform;
 
 use std::borrow::Cow;
-use std::net::SocketAddr;
 use std::time;
 
 use clap::{crate_name, crate_version};
@@ -131,7 +130,7 @@ use crate::proto::request::Request;
 use crate::proto::response::Response;
 use crate::session_manager::LONG_TIMEOUT;
 use crate::types::watch::WatchOption;
-use crate::types::{Acl, CreateMode, MultiResponse, Stat, WatchedEvent};
+use crate::types::{Acl, CreateMode, MultiResponse, Stat, WatchedEvent, ZkConnectString};
 
 // TODO Enforce path constraints?
 // https://zookeeper.apache.org/doc/r3.4.12/zookeeperProgrammers.html#ch_zkDataModel
@@ -167,7 +166,6 @@ use crate::types::{Acl, CreateMode, MultiResponse, Stat, WatchedEvent};
 ///
 #[derive(Debug, Clone)]
 pub struct ZooKeeper {
-    #[allow(dead_code)]
     connection: Enqueuer,
     logger: slog::Logger,
 }
@@ -224,12 +222,20 @@ impl ZooKeeperBuilder {
     /// attempt to reconnect until the session timeout expires. Only then should
     /// the application call connect() again.
     ///
-    pub async fn connect(self, addr: &SocketAddr) -> (ZooKeeper, UnboundedReceiver<WatchedEvent>) {
-        let addr = *addr;
+    pub async fn connect(
+        self,
+        conn_str: &ZkConnectString,
+    ) -> (ZooKeeper, UnboundedReceiver<WatchedEvent>) {
         let log = self.logger.clone();
         let (tx, rx) = mpsc::unbounded();
-        let enqueuer =
-            SharedState::start(addr, tx, self.session_timeout, self.read_only, log).await;
+        let enqueuer = SharedState::start(
+            conn_str.clone(),
+            tx,
+            self.session_timeout,
+            self.read_only,
+            log,
+        )
+        .await;
         (
             ZooKeeper {
                 connection: enqueuer,
@@ -267,8 +273,8 @@ impl ZooKeeper {
     ///
     /// See [`ZooKeeperBuilder::connect`].
     ///
-    pub async fn connect(addr: &SocketAddr) -> (Self, UnboundedReceiver<WatchedEvent>) {
-        ZooKeeperBuilder::default().connect(addr).await
+    pub async fn connect(conn_str: &ZkConnectString) -> (Self, UnboundedReceiver<WatchedEvent>) {
+        ZooKeeperBuilder::default().connect(conn_str).await
     }
 
     ///

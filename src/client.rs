@@ -4,7 +4,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::mem;
-use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -29,6 +28,7 @@ use crate::proto::request::{OpCode, Request};
 use crate::proto::response::{Response, FIRST_XID, HEARTBEAT_XID, SHUTDOWN_XID, WATCH_XID};
 use crate::session_manager::SessionManager;
 use crate::types::watch::{KeeperState, Watch, WatchOption, WatchType, WatchedEvent};
+use crate::types::ZkConnectString;
 
 pub(crate) type ReplyRecord = (OpCode, Sender<Result<Response, ZkError>>);
 pub(crate) type RequestTuple = (Request, Sender<Result<Response, ZkError>>);
@@ -73,9 +73,6 @@ impl Drop for TaskTracker {
 //
 #[derive(Clone)]
 pub(crate) struct SharedState {
-    // Address of the ZooKeeper server
-    addr: SocketAddr,
-
     // The channel over which requests come from the user
     rx: Arc<AsyncMutex<UnboundedReceiver<RequestTuple>>>,
 
@@ -95,7 +92,7 @@ pub(crate) struct SharedState {
     // Global map of pending watches.
     //
     // Watches are only registered once we have confirmed that the operation
-    // that initiated the watch did not fail. Thust, we must stage watches here
+    // that initiated the watch did not fail. Thus, we must stage watches here
     // first. The map is indexed by xid.
     //
     // The one exception: a watch can still be added if a call to exists()
@@ -117,7 +114,7 @@ impl SharedState {
     // Runs the client. This method is called from `ZooKeeper::connect()`.
     //
     pub(crate) async fn start(
-        addr: SocketAddr,
+        conn_str: ZkConnectString,
         default_watcher: UnboundedSender<WatchedEvent>,
         session_timeout: Duration,
         read_only: bool,
@@ -136,7 +133,7 @@ impl SharedState {
         let (tx, rx) = mpsc::unbounded();
 
         let sess_mgr = SessionManager::new(
-            addr,
+            conn_str,
             Arc::clone(&xid),
             tx.clone(),
             session_timeout,
@@ -199,7 +196,6 @@ impl SharedState {
                 pending_watches: Arc::new(Mutex::new(HashMap::new())),
                 watches,
                 default_watcher,
-                addr,
             };
             match s.run(bg_barrier, abort_handles).await {
                 Err(e) => {

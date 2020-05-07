@@ -41,7 +41,7 @@ pub(crate) struct ZkDecoder {
     // Global map of pending watches.
     //
     // Watches are only registered once we have confirmed that the operation
-    // that initiated the watch did not fail. Thust, we must stage watches here
+    // that initiated the watch did not fail. Thus, we must stage watches here
     // first. The map is indexed by xid.
     //
     // The one exception: a watch can still be added if a call to exists()
@@ -78,6 +78,158 @@ impl ZkDecoder {
             log,
         }
     }
+
+    fn handle_watch_event(&mut self, mut buf: &[u8]) {
+        // Deserialize the WatchedEvent
+        let e = WatchedEvent::read_from(&mut buf).unwrap();
+        debug!(self.log, "got watch event {:?}", e);
+
+        let mut watches = self.watches.lock().unwrap();
+        let mut remove_watch_list = false;
+        let mut global_watch = false;
+
+        // Check for any custom watches set by the user and notify them
+        if let Some(watch_list) = watches.get_mut(&e.path) {
+            trace!(self.log,
+                   "found potentially waiting custom watchers";
+                   "n" => watch_list.len()
+            );
+
+            //
+            // Iterate throught the watches and find any that the event
+            // matches. If we find a match, remove the watch from the Vec.
+            //
+            // We iterate in reverse so we can safely use swap_remove() for
+            // removal from the Vec, knowing that we've already iterated
+            // over the last element in the Vec.
+            //
+            for i in (0..watch_list.len()).rev() {
+                let watch_matched = match (watch_list[i].wtype, e.event_type) {
+                    (WatchType::Child, WatchedEventType::NodeDeleted)
+                    | (WatchType::Child, WatchedEventType::NodeChildrenChanged) => true,
+                    (WatchType::Child, _) => false,
+                    (WatchType::Data, WatchedEventType::NodeDeleted)
+                    | (WatchType::Data, WatchedEventType::NodeDataChanged) => true,
+                    (WatchType::Data, _) => false,
+                    (WatchType::Exist, WatchedEventType::NodeChildrenChanged) => false,
+                    (WatchType::Exist, _) => true,
+                };
+
+                if watch_matched {
+                    let w = watch_list.swap_remove(i);
+                    //
+                    // We send without worrying about the result, because
+                    // the user may have dropped the receiver, and that's
+                    // ok.
+                    //
+                    let _ = w.tx.send(e.clone());
+                } else {
+                    //
+                    // There were other non-global watches set on this path,
+                    // but none of them matched this event.
+                    //
+                    global_watch = true;
+                }
+            }
+            if watch_list.is_empty() {
+                remove_watch_list = true;
+            }
+        } else {
+            global_watch = true;
+        }
+
+        if remove_watch_list {
+            watches.remove(&e.path).expect(
+                "tried to remove a watch list for a path with no \
+                 registered watches",
+            );
+        }
+
+        if global_watch {
+            //
+            // We ignore any send errors, because the user may have dropped
+            // the default watcher, and that's ok.
+            //
+            let _ = self.default_watcher.unbounded_send(e);
+        }
+    }
+
+    //
+    // A complicated response type to mirror the response type of the
+    // ZkDecoder's decode() function. The outer result signifies whether or not
+    // the actual decoding of the response failed. The inner result, which is
+    // returned if the decoding succeeded, indicates whether or not the client
+    // encountered some logic error.
+    //
+    fn handle_response(
+        &mut self,
+        mut buf: &[u8],
+        xid: i32,
+        err: Option<ZkError>,
+    ) -> Result<Result<(), InternalError>, IoError> {
+        // Find the waiting request
+        let (opcode, tx) = match self.replies.lock().unwrap().remove(&xid) {
+            Some(tuple) => tuple,
+            None => {
+                // TODO Should this ever happen?
+                return Ok(Err(InternalError::DanglingXid(xid)));
+            }
+        };
+
+        //
+        // If the request tried to set a watch, we confirm that the request
+        // has succeeded and register the watch if so.
+        //
+        if let Some((path, watch)) = self.pending_watches.lock().unwrap().remove(&xid) {
+            //
+            // Normally, a requested watch is only added once the initial
+            // operation is successful. The one exception to this is if an
+            // exists call fails with NoNode.
+            //
+            if err.is_none() || (opcode == request::OpCode::Exists && err == Some(ZkError::NoNode))
+            {
+                debug!(self.log, "pending watch turned into real watch"; "xid" => xid);
+                self.watches
+                    .lock()
+                    .unwrap()
+                    .entry(path)
+                    .or_insert_with(Vec::new)
+                    .push(watch);
+            } else {
+                debug!(self.log,
+                       "pending watch not turned into real watch: {:?}",
+                       err;
+                       "xid" => xid
+                );
+            }
+        }
+
+        //
+        // We send the ZkError or successful response data to the user.
+        //
+        if let Some(e) = err {
+            info!(self.log,
+                       "handling server error response: {:?}", e;
+                       "xid" => xid, "opcode" => ?opcode);
+            tx.send(Err(e)).expect("Internal rx for response dropped");
+        } else {
+            match Response::parse(opcode, &mut buf) {
+                Ok(r) => {
+                    debug!(self.log,
+                               "handling server response: {:?}", r;
+                               "xid" => xid, "opcode" => ?opcode);
+                    if let Response::Connect { .. } = r {
+                        panic!("Regular ZkDecoder received connect response");
+                    }
+                    tx.send(Ok(r)).expect("Internal rx for response dropped");
+                }
+                Err(e) => {
+                    return Err(e);
+                }
+            }
+        }
+        Ok(Ok(()))
+    }
 }
 
 impl Decoder for ZkDecoder {
@@ -94,10 +246,6 @@ impl Decoder for ZkDecoder {
     type Error = IoError;
 
     fn decode(&mut self, src: &mut BytesMut) -> Result<Option<Self::Item>, Self::Error> {
-        fn wrap<T, E>(item: T) -> Result<Option<T>, E> {
-            Ok(Some(item))
-        }
-
         //
         // We can read from the slice and take advantage of its cursor-tracking
         // without modifying the actual BytesMut buffer
@@ -134,160 +282,37 @@ impl Decoder for ZkDecoder {
         //
         // A watch has triggered.
         //
-        if xid == WATCH_XID {
-            // Deserialize the WatchedEvent
-            let e = WatchedEvent::read_from(&mut buf)?;
-            debug!(self.log, "got watch event {:?}", e);
-
-            let mut watches = self.watches.lock().unwrap();
-            let mut remove_watch_list = false;
-            let mut global_watch = false;
-
-            // Check for any custom watches set by the user and notify them
-            if let Some(watch_list) = watches.get_mut(&e.path) {
-                trace!(self.log,
-                       "found potentially waiting custom watchers";
-                       "n" => watch_list.len()
-                );
-
-                //
-                // Iterate throught the watches and find any that the event
-                // matches. If we find a match, remove the watch from the Vec.
-                //
-                // We iterate in reverse so we can safely use swap_remove() for
-                // removal from the Vec, knowing that we've already iterated
-                // over the last element in the Vec.
-                //
-                for i in (0..watch_list.len()).rev() {
-                    let watch_matched = match (watch_list[i].wtype, e.event_type) {
-                        (WatchType::Child, WatchedEventType::NodeDeleted)
-                        | (WatchType::Child, WatchedEventType::NodeChildrenChanged) => true,
-                        (WatchType::Child, _) => false,
-                        (WatchType::Data, WatchedEventType::NodeDeleted)
-                        | (WatchType::Data, WatchedEventType::NodeDataChanged) => true,
-                        (WatchType::Data, _) => false,
-                        (WatchType::Exist, WatchedEventType::NodeChildrenChanged) => false,
-                        (WatchType::Exist, _) => true,
-                    };
-
-                    if watch_matched {
-                        let w = watch_list.swap_remove(i);
-                        //
-                        // We send without worrying about the result, because
-                        // the user may have dropped the receiver, and that's
-                        // ok.
-                        //
-                        let _ = w.tx.send(e.clone());
-                    } else {
-                        //
-                        // There were other non-global watches set on this path,
-                        // but none of them matched this event.
-                        //
-                        global_watch = true;
-                    }
-                }
-                if watch_list.is_empty() {
-                    remove_watch_list = true;
-                }
-            } else {
-                global_watch = true;
-            }
-
-            if remove_watch_list {
-                watches.remove(&e.path).expect(
-                    "tried to remove a watch list for a path with no \
-                     registered watches",
-                );
-            }
-
-            if global_watch {
-                //
-                // We ignore any send errors, because the user may have dropped
-                // the default watcher, and that's ok.
-                //
-                let _ = self.default_watcher.unbounded_send(e);
-            }
+        let result = if xid == WATCH_XID {
+            assert!(err == None);
+            self.handle_watch_event(buf);
+            let result = Ok(zxid);
+            Ok(Some(result))
         //
         // Response to ping. The response is empty beyond the xid/zxid/err.
         //
         } else if xid == HEARTBEAT_XID {
             trace!(self.log, "got response to heartbeat");
-            if let Some(e) = err {
-                src.advance(msg_len + HEADER_SIZE);
-                return wrap(Err(InternalError::ServerError(e)));
-            }
+            let result = if let Some(e) = err {
+                Err(InternalError::ServerError(e))
+            } else {
+                Ok(zxid)
+            };
+            Ok(Some(result))
         //
         // Response to request
         //
         } else {
-            // Find the waiting request
-            let (opcode, tx) = match self.replies.lock().unwrap().remove(&xid) {
-                Some(tuple) => tuple,
-                None => {
-                    // TODO Should this ever happen?
-                    src.advance(msg_len + HEADER_SIZE);
-                    return wrap(Err(InternalError::DanglingXid(xid)));
-                }
-            };
+            //
+            // Handle the response, then convert a successful result to an
+            // option and stick the zxid in it.
+            //
+            self.handle_response(buf, xid, err)
+                .map(|item| Some(item.map(|_| zxid)))
+        };
 
-            //
-            // If the request tried to set a watch, we confirm that the request
-            // has succeeded and register the watch if so.
-            //
-            if let Some((path, watch)) = self.pending_watches.lock().unwrap().remove(&xid) {
-                //
-                // Normally, a requested watch is only added once the initial
-                // operation is successful. The one exception to this is if an
-                // exists call fails with NoNode.
-                //
-                if err.is_none()
-                    || (opcode == request::OpCode::Exists && err == Some(ZkError::NoNode))
-                {
-                    debug!(self.log, "pending watch turned into real watch"; "xid" => xid);
-                    self.watches
-                        .lock()
-                        .unwrap()
-                        .entry(path)
-                        .or_insert_with(Vec::new)
-                        .push(watch);
-                } else {
-                    debug!(self.log,
-                           "pending watch not turned into real watch: {:?}",
-                           err;
-                           "xid" => xid
-                    );
-                }
-            }
-
-            //
-            // We send the ZkError or successful response data to the user.
-            //
-            if let Some(e) = err {
-                info!(self.log,
-                       "handling server error response: {:?}", e;
-                       "xid" => xid, "opcode" => ?opcode);
-                tx.send(Err(e)).expect("Internal rx for response dropped");
-            } else {
-                match Response::parse(opcode, &mut buf) {
-                    Ok(r) => {
-                        debug!(self.log,
-                               "handling server response: {:?}", r;
-                               "xid" => xid, "opcode" => ?opcode);
-                        if let Response::Connect { .. } = r {
-                            panic!("Regular ZkDecoder received connect response");
-                        }
-                        tx.send(Ok(r)).expect("Internal rx for response dropped");
-                    }
-                    Err(e) => {
-                        src.advance(msg_len + HEADER_SIZE);
-                        return Err(e);
-                    }
-                }
-            }
-        }
         src.advance(msg_len + HEADER_SIZE);
         src.reserve(MINIMUM_RESPONSE_SIZE);
-        wrap(Ok(zxid))
+        result
     }
 }
 
@@ -331,8 +356,11 @@ impl Decoder for ZkConnDecoder {
             return Ok(None);
         }
 
-        Response::parse(OpCode::CreateSession, &mut buf)
+        let resp = Response::parse(OpCode::CreateSession, &mut buf)
             .map(Some)
-            .map_err(InternalError::from)
+            .map_err(InternalError::from);
+        src.advance(msg_len + HEADER_SIZE);
+        src.reserve(MINIMUM_RESPONSE_SIZE);
+        resp
     }
 }

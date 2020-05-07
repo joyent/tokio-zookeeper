@@ -14,6 +14,7 @@ use futures::channel::oneshot::{self, Sender};
 use futures::lock::Mutex as AsyncMutex;
 use futures::sink::SinkExt;
 use futures::stream::StreamExt;
+use rand::Rng;
 use slog::{debug, error, info, trace, Logger};
 use tokio::io::{self, ReadHalf, WriteHalf};
 use tokio::net::TcpStream;
@@ -25,11 +26,14 @@ use crate::proto::decoder::ZkConnDecoder;
 use crate::proto::encoder::{RequestWrapper, ZkEncoder};
 use crate::proto::request::Request;
 use crate::proto::response::Response;
+use crate::types::ZkConnectString;
 
 //
 // See: https://genius.com/Built-to-spill-randy-described-eternity-lyrics
 //
 pub(crate) const LONG_TIMEOUT: Duration = Duration::from_secs(u64::MAX);
+
+const NO_DELAY: Duration = Duration::from_secs(0);
 
 ///
 /// Fields for re-connection
@@ -85,10 +89,56 @@ impl SessionInfo {
     }
 }
 
+//
+// Encapsulates a ZkConnectString with some bookkeeping to keep track of which
+// address the client should attempt to connect to next, and how many connection
+// attempts have failed in a row. Provides methods for getting the next address,
+// resetting the number of failed attempts, and checking if the client should
+// wait before trying to connect again.
+//
+#[derive(Debug)]
+struct ZkConnectStringState {
+    conn_str: ZkConnectString,
+    curr_idx: usize,
+    conn_attempts: usize,
+}
+
+impl ZkConnectStringState {
+    fn new(conn_str: ZkConnectString) -> Self {
+        let mut rng = rand::thread_rng();
+        let idx: usize = rng.gen_range(0, conn_str.len());
+
+        ZkConnectStringState {
+            conn_str,
+            curr_idx: idx,
+            conn_attempts: 0,
+        }
+    }
+
+    fn next_addr(&mut self) -> SocketAddr {
+        let ret = self
+            .conn_str
+            .get_addr_at(self.curr_idx)
+            .expect("connect string access out of bounds");
+        self.curr_idx += 1;
+        self.curr_idx %= self.conn_str.len();
+        self.conn_attempts += 1;
+        ret
+    }
+
+    fn reset_attempts(&mut self) {
+        self.conn_attempts = 0;
+    }
+
+    fn should_wait(&self) -> bool {
+        self.conn_attempts == self.conn_str.len()
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) struct SessionManager {
-    // Address of server
-    addr: SocketAddr,
+    // Server connect string and associated state
+    conn_str_state: Arc<AsyncMutex<ZkConnectStringState>>,
 
     // Next xid to issue
     xid: Arc<AsyncMutex<i32>>,
@@ -116,7 +166,7 @@ pub(crate) struct SessionManager {
 
 impl SessionManager {
     pub(crate) fn new(
-        addr: SocketAddr,
+        conn_str: ZkConnectString,
         xid: Arc<AsyncMutex<i32>>,
         req_tx: UnboundedSender<(Request, Sender<Result<Response, ZkError>>)>,
         session_timeout: Duration,
@@ -124,7 +174,7 @@ impl SessionManager {
         log: Logger,
     ) -> Self {
         SessionManager {
-            addr,
+            conn_str_state: Arc::new(AsyncMutex::new(ZkConnectStringState::new(conn_str))),
             xid,
             req_tx,
             session_info: Arc::new(AsyncMutex::new(SessionInfo::new(
@@ -164,12 +214,12 @@ impl SessionManager {
                 Some(Duration::from_millis(session_info.timeout as u64))
             }
         };
-        info!(self.log, "Connecting");
-        let mut delay = Duration::from_millis(0);
+        info!(self.log, "Beginning connect operation");
+        let mut delay = NO_DELAY;
         loop {
             debug!(
                 self.log,
-                "Attempting to connect";
+                "Delaying";
                 "delay_ms" => delay.as_millis()
             );
             time::delay_for(delay).await;
@@ -179,18 +229,26 @@ impl SessionManager {
                     if let InternalError::SessionExpired = e {
                         return Err(InternalError::SessionExpired);
                     }
-                    match backoff.next_backoff() {
-                        Some(interval) => {
-                            delay = interval;
-                            continue;
+                    let mut conn_str_state = self.conn_str_state.lock().await;
+                    if conn_str_state.should_wait() {
+                        conn_str_state.reset_attempts();
+                        match backoff.next_backoff() {
+                            Some(interval) => {
+                                delay = interval;
+                                continue;
+                            }
+                            //
+                            // The max time before session expiry elapsed
+                            //
+                            None => return Err(InternalError::SessionExpired),
                         }
-                        //
-                        // The max time before session expiry elapsed
-                        //
-                        None => return Err(InternalError::SessionExpired),
+                    } else {
+                        delay = NO_DELAY;
+                        continue;
                     }
                 }
                 Ok(result) => {
+                    self.conn_str_state.lock().await.reset_attempts();
                     *self.first.lock().await = false;
                     return Ok(result);
                 }
@@ -224,7 +282,9 @@ impl SessionManager {
                 read_only: session_info.read_only,
             }
         };
-        let conn = TcpStream::connect(self.addr).await?;
+        let addr = self.conn_str_state.lock().await.next_addr();
+        info!(self.log, "Attempting to connect"; "addr" => addr);
+        let conn = TcpStream::connect(addr).await?;
 
         let (mut conn_rx, mut conn_tx) = io::split(conn);
 

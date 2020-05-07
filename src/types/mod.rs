@@ -11,6 +11,12 @@ pub use self::watch::*;
 pub mod multi;
 pub use self::multi::*;
 
+use std::net::{AddrParseError, SocketAddr};
+use std::str::FromStr;
+
+use itertools::Itertools;
+use serde::Deserialize;
+
 ///
 /// Statistics about a znode, similar to the UNIX `stat` structure.
 ///
@@ -102,4 +108,74 @@ pub enum CreateMode {
     // ^----- is it a container?
     //  ^---- is it sequential?
     //   ^--- is it ephemeral?
+}
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ZkConnectStringError {
+    /// The connect string has no addresses
+    EmptyString,
+
+    /// An address in the connect string is malformed
+    MalformedAddr,
+}
+
+impl From<AddrParseError> for ZkConnectStringError {
+    fn from(_: AddrParseError) -> Self {
+        ZkConnectStringError::MalformedAddr
+    }
+}
+
+///
+/// `ZkConnectString` represents a list of zookeeper addresses to connect to.
+///
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+pub struct ZkConnectString(Vec<SocketAddr>);
+
+impl ZkConnectString {
+    //
+    // Gets a reference to the SocketAddr at the provided index. Returns None
+    // if the index is out of bounds.
+    //
+    pub(crate) fn get_addr_at(&self, index: usize) -> Option<SocketAddr> {
+        self.0.get(index).cloned()
+    }
+
+    //
+    // Returns the number of addresses in the ZkConnectString
+    //
+    pub(crate) fn len(&self) -> usize {
+        self.0.len()
+    }
+}
+
+impl ToString for ZkConnectString {
+    fn to_string(&self) -> String {
+        self.0
+            .iter()
+            .map(|x| x.to_string())
+            .intersperse(String::from(","))
+            .collect()
+    }
+}
+
+impl FromStr for ZkConnectString {
+    type Err = ZkConnectStringError;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        if s.is_empty() {
+            return Err(ZkConnectStringError::EmptyString);
+        }
+        let acc: Result<Vec<SocketAddr>, Self::Err> = Ok(vec![]);
+        s.split(',')
+            .map(|x| SocketAddr::from_str(x))
+            .fold(acc, |acc, x| match (acc, x) {
+                (Ok(mut addrs), Ok(addr)) => {
+                    addrs.push(addr);
+                    Ok(addrs)
+                }
+                (Err(e), _) => Err(e),
+                (_, Err(e)) => Err(ZkConnectStringError::from(e)),
+            })
+            .and_then(|x| Ok(ZkConnectString(x)))
+    }
 }
