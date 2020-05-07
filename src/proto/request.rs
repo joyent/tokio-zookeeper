@@ -170,9 +170,6 @@ impl WriteTo for u8 {
     }
 }
 
-//
-// XXX is there a way to avoid implementing WriteTo for both String and &String?
-//
 impl WriteTo for &String {
     fn write_to<B: BufMut>(&self, buf: &mut B) {
         buf.put_i32(self.len() as i32);
