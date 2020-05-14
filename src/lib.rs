@@ -111,6 +111,7 @@ pub mod error;
 pub mod proto;
 pub mod types;
 
+pub(crate) mod backoff;
 pub(crate) mod client;
 pub(crate) mod session_manager;
 pub(crate) mod transform;

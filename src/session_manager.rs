@@ -7,8 +7,6 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 use std::{cmp, i32, mem, u64};
 
-use backoff::backoff::Backoff;
-use backoff::ExponentialBackoff;
 use futures::channel::mpsc::UnboundedSender;
 use futures::channel::oneshot::{self, Sender};
 use futures::lock::Mutex as AsyncMutex;
@@ -21,6 +19,7 @@ use tokio::net::TcpStream;
 use tokio::time;
 use tokio_util::codec::{FramedRead, FramedWrite};
 
+use crate::backoff::ZkBackoff;
 use crate::error::{InternalError, ZkError};
 use crate::proto::decoder::ZkConnDecoder;
 use crate::proto::encoder::{RequestWrapper, ZkEncoder};
@@ -97,7 +96,7 @@ impl SessionInfo {
 // wait before trying to connect again.
 //
 #[derive(Debug)]
-struct ZkConnectStringState {
+pub(crate) struct ZkConnectStringState {
     conn_str: ZkConnectString,
     curr_idx: usize,
     conn_attempts: usize,
@@ -126,11 +125,11 @@ impl ZkConnectStringState {
         ret
     }
 
-    fn reset_attempts(&mut self) {
+    pub(crate) fn reset_attempts(&mut self) {
         self.conn_attempts = 0;
     }
 
-    fn should_wait(&self) -> bool {
+    pub(crate) fn should_wait(&self) -> bool {
         self.conn_attempts == self.conn_str.len()
     }
 }
@@ -140,6 +139,9 @@ pub(crate) struct SessionManager {
     // Server connect string and associated state
     conn_str_state: Arc<AsyncMutex<ZkConnectStringState>>,
 
+    // Backoff state
+    backoff: Arc<AsyncMutex<ZkBackoff>>,
+
     // Next xid to issue
     xid: Arc<AsyncMutex<i32>>,
 
@@ -148,9 +150,6 @@ pub(crate) struct SessionManager {
 
     // Shared reference to session info parameters
     session_info: Arc<AsyncMutex<SessionInfo>>,
-
-    // Whether or not this is our first time connecting to the server
-    first: Arc<AsyncMutex<bool>>,
 
     // Whether or not the client has exited
     exited: Arc<AsyncMutex<bool>>,
@@ -175,13 +174,17 @@ impl SessionManager {
     ) -> Self {
         SessionManager {
             conn_str_state: Arc::new(AsyncMutex::new(ZkConnectStringState::new(conn_str))),
+            //
+            // We pass `None` as the max_elapsed_time argument because the
+            // initial connect operation has no timeout.
+            //
+            backoff: Arc::new(AsyncMutex::new(ZkBackoff::new(None, log.clone()))),
             xid,
             req_tx,
             session_info: Arc::new(AsyncMutex::new(SessionInfo::new(
                 session_timeout,
                 read_only,
             ))),
-            first: Arc::new(AsyncMutex::new(true)),
             exited: Arc::new(AsyncMutex::new(false)),
             last_contact: Arc::new(AsyncMutex::new(Instant::now())),
             log,
@@ -194,27 +197,8 @@ impl SessionManager {
     pub(crate) async fn reconnect(
         &self,
     ) -> Result<(WriteHalf<TcpStream>, ReadHalf<TcpStream>), InternalError> {
-        let mut backoff = ExponentialBackoff::default();
-        backoff.max_elapsed_time = {
-            if *self.first.lock().await {
-                //
-                // If we're establishing a new session, there is no session
-                // timeout to serve as an upper bound for the time to connect.
-                //
-                None
-            } else {
-                //
-                // If the session timeout has elapsed, we can't possibly
-                // reconnect.
-                //
-                // TODO implement stability threshold for backoff
-                // TODO implement zkconnectstring
-                //
-                let session_info = self.session_info.lock().await;
-                Some(Duration::from_millis(session_info.timeout as u64))
-            }
-        };
         info!(self.log, "Beginning connect operation");
+        self.backoff.lock().await.start_operation().await;
         let mut delay = NO_DELAY;
         loop {
             debug!(
@@ -223,35 +207,29 @@ impl SessionManager {
                 "delay_ms" => delay.as_millis()
             );
             time::delay_for(delay).await;
-            match self.reconnect_inner().await {
-                Err(e) => {
-                    error!(self.log, "Error connecting to ZooKeeper: {:?}", e);
-                    if let InternalError::SessionExpired = e {
-                        return Err(InternalError::SessionExpired);
-                    }
-                    let mut conn_str_state = self.conn_str_state.lock().await;
-                    if conn_str_state.should_wait() {
-                        conn_str_state.reset_attempts();
-                        match backoff.next_backoff() {
-                            Some(interval) => {
-                                delay = interval;
-                                continue;
-                            }
-                            //
-                            // The max time before session expiry elapsed
-                            //
-                            None => return Err(InternalError::SessionExpired),
-                        }
-                    } else {
-                        delay = NO_DELAY;
+            let result = self.reconnect_inner().await;
+            if let Err(e) = result {
+                error!(self.log, "Error connecting to ZooKeeper: {:?}", e);
+                if let InternalError::SessionExpired = e {
+                    return Err(InternalError::SessionExpired);
+                }
+                match self
+                    .backoff
+                    .lock()
+                    .await
+                    .next_delay(Arc::clone(&self.conn_str_state))
+                    .await
+                {
+                    Some(interval) => {
+                        delay = interval;
                         continue;
                     }
+                    // The max time before session expiry elapsed
+                    None => return Err(InternalError::SessionExpired),
                 }
-                Ok(result) => {
-                    self.conn_str_state.lock().await.reset_attempts();
-                    *self.first.lock().await = false;
-                    return Ok(result);
-                }
+            } else {
+                self.conn_str_state.lock().await.reset_attempts();
+                return result;
             }
         }
     }
@@ -322,6 +300,16 @@ impl SessionManager {
             }
             info!(self.log, "negotiated session timeout: {}ms", timeout);
 
+            //
+            // Now that we've connected, we can use the session timeout to put
+            // an upper bound on the amount of time a reconnect attempt can
+            // take before guaranteed session expiry.
+            //
+            self.backoff
+                .lock()
+                .await
+                .set_max_elapsed_time(Some(Duration::from_millis(timeout as u64)))
+                .await;
             let mut session_info = self.session_info.lock().await;
             session_info.protocol_version = protocol_version;
             session_info.session_id = session_id;
