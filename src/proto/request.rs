@@ -1,14 +1,21 @@
-use byteorder::{BigEndian, WriteBytesExt};
+//
+// Copyright 2020 Joyent, Inc.
+//
+
 use std::borrow::Cow;
-use std::io::{self, Write};
+use std::collections::HashSet;
+
+use bytes::{BufMut, BytesMut};
 
 use crate::error::ZkError;
 use crate::types::acl::Acl;
-use crate::types::watch::Watch;
+use crate::types::watch::WatchOption;
 use crate::types::CreateMode;
 
 #[derive(Debug)]
 pub(crate) enum Request {
+    Ping,
+    Close,
     Connect {
         protocol_version: i32,
         last_zxid_seen: i64,
@@ -19,7 +26,7 @@ pub(crate) enum Request {
     },
     Exists {
         path: String,
-        watch: Watch,
+        watch: WatchOption,
     },
     Delete {
         path: String,
@@ -38,11 +45,11 @@ pub(crate) enum Request {
     },
     GetChildren {
         path: String,
-        watch: Watch,
+        watch: WatchOption,
     },
     GetData {
         path: String,
-        watch: Watch,
+        watch: WatchOption,
     },
     GetAcl {
         path: String,
@@ -56,13 +63,19 @@ pub(crate) enum Request {
         path: String,
         version: i32,
     },
+    SetWatches {
+        last_zxid_seen: i64,
+        data: HashSet<String>,
+        exists: HashSet<String>,
+        children: HashSet<String>,
+    },
     Multi(Vec<Request>),
 }
 
 #[derive(Clone, Copy, Debug, Hash, Eq, PartialEq, Ord, PartialOrd)]
 #[repr(i32)]
 #[allow(dead_code)]
-pub(super) enum OpCode {
+pub(crate) enum OpCode {
     Notification = 0,
     Create = 1,
     Delete = 2,
@@ -120,73 +133,79 @@ pub(super) enum MultiHeader {
 }
 
 pub trait WriteTo {
-    fn write_to<W: Write>(&self, writer: W) -> io::Result<()>;
+    fn write_to<B: BufMut>(&self, buf: &mut B);
 }
 
 impl WriteTo for Acl {
-    fn write_to<W: Write>(&self, mut writer: W) -> io::Result<()> {
-        writer.write_u32::<BigEndian>(self.perms.code())?;
-        self.scheme.write_to(&mut writer)?;
-        self.id.write_to(writer)
+    fn write_to<B: BufMut>(&self, buf: &mut B) {
+        buf.put_u32(self.perms.code());
+        self.scheme.write_to(buf);
+        self.id.write_to(buf)
     }
 }
 
 impl WriteTo for MultiHeader {
-    fn write_to<W: Write>(&self, mut writer: W) -> io::Result<()> {
+    fn write_to<B: BufMut>(&self, buf: &mut B) {
         match *self {
             MultiHeader::NextOk(opcode) => {
-                writer.write_i32::<BigEndian>(opcode as i32)?;
-                writer.write_u8(false as u8)?;
-                writer.write_i32::<BigEndian>(-1)
+                buf.put_i32(opcode as i32);
+                buf.put_u8(false as u8);
+                buf.put_i32(-1)
             }
             MultiHeader::NextErr(_) => {
                 panic!("client should not serialize MultiHeader::NextErr");
             }
             MultiHeader::Done => {
-                writer.write_i32::<BigEndian>(-1)?;
-                writer.write_u8(true as u8)?;
-                writer.write_i32::<BigEndian>(-1)
+                buf.put_i32(-1);
+                buf.put_u8(true as u8);
+                buf.put_i32(-1)
             }
         }
     }
 }
 
 impl WriteTo for u8 {
-    fn write_to<W: Write>(&self, mut writer: W) -> io::Result<()> {
-        writer.write_u8(*self)?;
-        Ok(())
+    fn write_to<B: BufMut>(&self, buf: &mut B) {
+        buf.put_u8(*self);
     }
 }
 
-impl WriteTo for str {
-    fn write_to<W: Write>(&self, mut writer: W) -> io::Result<()> {
-        writer.write_i32::<BigEndian>(self.len() as i32)?;
-        writer.write_all(self.as_ref())
+impl WriteTo for &String {
+    fn write_to<B: BufMut>(&self, buf: &mut B) {
+        buf.put_i32(self.len() as i32);
+        buf.put(self.as_str().as_ref());
+    }
+}
+
+impl WriteTo for String {
+    fn write_to<B: BufMut>(&self, buf: &mut B) {
+        buf.put_i32(self.len() as i32);
+        buf.put(self.as_str().as_ref());
     }
 }
 
 impl WriteTo for [u8] {
-    fn write_to<W: Write>(&self, mut writer: W) -> io::Result<()> {
-        writer.write_i32::<BigEndian>(self.len() as i32)?;
-        writer.write_all(self.as_ref())
+    fn write_to<B: BufMut>(&self, buf: &mut B) {
+        buf.put_i32(self.len() as i32);
+        buf.put(self);
     }
 }
 
-fn write_list<W, T>(mut writer: W, ts: &[T]) -> io::Result<()>
+fn write_list<B, T>(buf: &mut B, ts: &[T])
 where
     T: WriteTo,
-    W: Write,
+    B: BufMut,
 {
-    writer.write_i32::<BigEndian>(ts.len() as i32)?;
+    buf.put_i32(ts.len() as i32);
     for elem in ts {
-        elem.write_to(&mut writer)?;
+        elem.write_to(buf);
     }
-    Ok(())
 }
 
 impl Request {
-    pub(super) fn serialize_into(&self, buffer: &mut Vec<u8>) -> Result<(), io::Error> {
+    pub(super) fn serialize_into(&self, buffer: &mut BytesMut) {
         match *self {
+            Request::Ping | Request::Close => {}
             Request::Connect {
                 protocol_version,
                 last_zxid_seen,
@@ -195,13 +214,13 @@ impl Request {
                 ref passwd,
                 read_only,
             } => {
-                buffer.write_i32::<BigEndian>(protocol_version)?;
-                buffer.write_i64::<BigEndian>(last_zxid_seen)?;
-                buffer.write_i32::<BigEndian>(timeout)?;
-                buffer.write_i64::<BigEndian>(session_id)?;
-                buffer.write_i32::<BigEndian>(passwd.len() as i32)?;
-                buffer.write_all(passwd)?;
-                buffer.write_u8(read_only as u8)?;
+                buffer.put_i32(protocol_version);
+                buffer.put_i64(last_zxid_seen);
+                buffer.put_i32(timeout);
+                buffer.put_i64(session_id);
+                buffer.put_i32(passwd.len() as i32);
+                buffer.put(&passwd[..]);
+                buffer.put_u8(read_only as u8);
             }
             Request::GetData {
                 ref path,
@@ -215,21 +234,21 @@ impl Request {
                 ref path,
                 ref watch,
             } => {
-                path.write_to(&mut *buffer)?;
-                buffer.write_u8(watch.to_u8())?;
+                path.write_to(buffer);
+                buffer.put_u8(watch.to_u8());
             }
             Request::Delete { ref path, version } => {
-                path.write_to(&mut *buffer)?;
-                buffer.write_i32::<BigEndian>(version)?;
+                path.write_to(buffer);
+                buffer.put_i32(version);
             }
             Request::SetData {
                 ref path,
                 ref data,
                 version,
             } => {
-                path.write_to(&mut *buffer)?;
-                data.write_to(&mut *buffer)?;
-                buffer.write_i32::<BigEndian>(version)?;
+                path.write_to(buffer);
+                data.write_to(buffer);
+                buffer.put_i32(version);
             }
             Request::Create {
                 ref path,
@@ -237,40 +256,52 @@ impl Request {
                 mode,
                 ref acl,
             } => {
-                path.write_to(&mut *buffer)?;
-                data.write_to(&mut *buffer)?;
-                write_list(&mut *buffer, acl)?;
-                buffer.write_i32::<BigEndian>(mode as i32)?;
+                path.write_to(buffer);
+                data.write_to(buffer);
+                write_list(buffer, acl);
+                buffer.put_i32(mode as i32);
             }
             Request::GetAcl { ref path } => {
-                path.write_to(&mut *buffer)?;
+                path.write_to(buffer);
             }
             Request::SetAcl {
                 ref path,
                 ref acl,
                 version,
             } => {
-                path.write_to(&mut *buffer)?;
-                write_list(&mut *buffer, acl)?;
-                buffer.write_i32::<BigEndian>(version)?;
+                path.write_to(buffer);
+                write_list(buffer, acl);
+                buffer.put_i32(version);
             }
             Request::Check { ref path, version } => {
-                path.write_to(&mut *buffer)?;
-                buffer.write_i32::<BigEndian>(version)?;
+                path.write_to(buffer);
+                buffer.put_i32(version);
+            }
+            Request::SetWatches {
+                last_zxid_seen,
+                ref data,
+                ref exists,
+                ref children,
+            } => {
+                buffer.put_i64(last_zxid_seen);
+                write_list(buffer, &data.iter().collect::<Vec<&String>>());
+                write_list(buffer, &exists.iter().collect::<Vec<&String>>());
+                write_list(buffer, &children.iter().collect::<Vec<&String>>());
             }
             Request::Multi(ref requests) => {
                 for r in requests {
-                    MultiHeader::NextOk(r.opcode()).write_to(&mut *buffer)?;
-                    r.serialize_into(&mut *buffer)?;
+                    MultiHeader::NextOk(r.opcode()).write_to(buffer);
+                    r.serialize_into(buffer);
                 }
-                MultiHeader::Done.write_to(&mut *buffer)?;
+                MultiHeader::Done.write_to(buffer);
             }
         }
-        Ok(())
     }
 
-    pub(super) fn opcode(&self) -> OpCode {
+    pub(crate) fn opcode(&self) -> OpCode {
         match *self {
+            Request::Ping => OpCode::Ping,
+            Request::Close => OpCode::CloseSession,
             Request::Connect { .. } => OpCode::CreateSession,
             Request::Exists { .. } => OpCode::Exists,
             Request::Delete { .. } => OpCode::Delete,
@@ -281,6 +312,7 @@ impl Request {
             Request::GetAcl { .. } => OpCode::GetACL,
             Request::SetAcl { .. } => OpCode::SetACL,
             Request::Multi { .. } => OpCode::Multi,
+            Request::SetWatches { .. } => OpCode::SetWatches,
             Request::Check { .. } => OpCode::Check,
         }
     }

@@ -1,13 +1,21 @@
-use byteorder::{BigEndian, ReadBytesExt};
-use failure;
-use std::io::{self, Read};
+//
+// Copyright 2020 Joyent, Inc.
+//
 
-use super::request::{MultiHeader, OpCode};
+use std::io::{Error as IoError, ErrorKind, Read, Result as IoResult};
+
+use byteorder::{BigEndian, ReadBytesExt};
 
 use crate::error::ZkError;
+use crate::proto::request::{MultiHeader, OpCode};
 use crate::types::acl::Acl;
 use crate::types::watch::{WatchedEvent, WatchedEventType};
 use crate::types::{KeeperState, Permission, Stat};
+
+pub(crate) const SHUTDOWN_XID: i32 = 0;
+pub(crate) const WATCH_XID: i32 = -1;
+pub(crate) const HEARTBEAT_XID: i32 = -2;
+pub(crate) const FIRST_XID: i32 = 1;
 
 #[derive(Debug)]
 pub(crate) enum Response {
@@ -34,11 +42,11 @@ pub(crate) enum Response {
 }
 
 pub trait ReadFrom: Sized {
-    fn read_from<R: Read>(read: &mut R) -> io::Result<Self>;
+    fn read_from<R: Read>(read: &mut R) -> IoResult<Self>;
 }
 
 impl ReadFrom for Vec<String> {
-    fn read_from<R: Read>(read: &mut R) -> io::Result<Self> {
+    fn read_from<R: Read>(read: &mut R) -> IoResult<Self> {
         let len = read.read_i32::<BigEndian>()?;
         let mut items = Vec::with_capacity(len as usize);
         for _ in 0..len {
@@ -49,7 +57,7 @@ impl ReadFrom for Vec<String> {
 }
 
 impl ReadFrom for Stat {
-    fn read_from<R: Read>(read: &mut R) -> io::Result<Stat> {
+    fn read_from<R: Read>(read: &mut R) -> IoResult<Stat> {
         Ok(Stat {
             czxid: read.read_i64::<BigEndian>()?,
             mzxid: read.read_i64::<BigEndian>()?,
@@ -67,7 +75,7 @@ impl ReadFrom for Stat {
 }
 
 impl ReadFrom for WatchedEvent {
-    fn read_from<R: Read>(read: &mut R) -> io::Result<WatchedEvent> {
+    fn read_from<R: Read>(read: &mut R) -> IoResult<WatchedEvent> {
         let wtype = read.read_i32::<BigEndian>()?;
         let state = read.read_i32::<BigEndian>()?;
         let path = read.read_string()?;
@@ -80,7 +88,7 @@ impl ReadFrom for WatchedEvent {
 }
 
 impl ReadFrom for Vec<Acl> {
-    fn read_from<R: Read>(read: &mut R) -> io::Result<Self> {
+    fn read_from<R: Read>(read: &mut R) -> IoResult<Self> {
         let len = read.read_i32::<BigEndian>()?;
         let mut items = Vec::with_capacity(len as usize);
         for _ in 0..len {
@@ -91,7 +99,7 @@ impl ReadFrom for Vec<Acl> {
 }
 
 impl ReadFrom for Acl {
-    fn read_from<R: Read>(read: &mut R) -> io::Result<Self> {
+    fn read_from<R: Read>(read: &mut R) -> IoResult<Self> {
         let perms = Permission::read_from(read)?;
         let scheme = read.read_string()?;
         let id = read.read_string()?;
@@ -100,13 +108,13 @@ impl ReadFrom for Acl {
 }
 
 impl ReadFrom for Permission {
-    fn read_from<R: Read>(read: &mut R) -> io::Result<Self> {
+    fn read_from<R: Read>(read: &mut R) -> IoResult<Self> {
         Ok(Permission::from_raw(read.read_u32::<BigEndian>()?))
     }
 }
 
 impl ReadFrom for MultiHeader {
-    fn read_from<R: Read>(read: &mut R) -> io::Result<Self> {
+    fn read_from<R: Read>(read: &mut R) -> IoResult<Self> {
         let opcode = read.read_i32::<BigEndian>()?;
         let done = read.read_u8()? != 0;
         let err = read.read_i32::<BigEndian>()?;
@@ -121,11 +129,11 @@ impl ReadFrom for MultiHeader {
 }
 
 pub trait BufferReader: Read {
-    fn read_buffer(&mut self) -> io::Result<Vec<u8>>;
+    fn read_buffer(&mut self) -> IoResult<Vec<u8>>;
 }
 
 impl<R: Read> BufferReader for R {
-    fn read_buffer(&mut self) -> io::Result<Vec<u8>> {
+    fn read_buffer(&mut self) -> IoResult<Vec<u8>> {
         let len = self.read_i32::<BigEndian>()?;
         let len = if len < 0 { 0 } else { len as usize };
         let mut buf = vec![0; len];
@@ -133,27 +141,24 @@ impl<R: Read> BufferReader for R {
         if read == len {
             Ok(buf)
         } else {
-            Err(io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "read_buffer failed",
-            ))
+            Err(IoError::new(ErrorKind::WouldBlock, "read_buffer failed"))
         }
     }
 }
 
 trait StringReader: Read {
-    fn read_string(&mut self) -> io::Result<String>;
+    fn read_string(&mut self) -> IoResult<String>;
 }
 
 impl<R: Read> StringReader for R {
-    fn read_string(&mut self) -> io::Result<String> {
+    fn read_string(&mut self) -> IoResult<String> {
         let raw = self.read_buffer()?;
-        Ok(String::from_utf8(raw).unwrap())
+        Ok(String::from_utf8(raw).expect("Bytes are not utf8"))
     }
 }
 
 impl Response {
-    pub(super) fn parse(opcode: OpCode, reader: &mut &[u8]) -> Result<Self, failure::Error> {
+    pub(super) fn parse(opcode: OpCode, reader: &mut &[u8]) -> Result<Self, IoError> {
         match opcode {
             OpCode::CreateSession => Ok(Response::Connect {
                 protocol_version: reader.read_i32::<BigEndian>()?,
@@ -169,14 +174,12 @@ impl Response {
                 bytes: reader.read_buffer()?,
                 stat: Stat::read_from(reader)?,
             }),
-            OpCode::Delete => Ok(Response::Empty),
             OpCode::GetChildren => Ok(Response::Strings(Vec::<String>::read_from(reader)?)),
             OpCode::Create => Ok(Response::String(reader.read_string()?)),
             OpCode::GetACL => Ok(Response::GetAcl {
                 acl: Vec::<Acl>::read_from(reader)?,
                 stat: Stat::read_from(reader)?,
             }),
-            OpCode::Check => Ok(Response::Empty),
             OpCode::Multi => {
                 let mut responses = Vec::new();
                 loop {
@@ -192,6 +195,9 @@ impl Response {
                     }
                 }
                 Ok(Response::Multi(responses))
+            }
+            OpCode::SetWatches | OpCode::CloseSession | OpCode::Delete | OpCode::Check => {
+                Ok(Response::Empty)
             }
             _ => panic!("got unexpected response opcode {:?}", opcode),
         }

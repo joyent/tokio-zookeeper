@@ -1,12 +1,18 @@
+//
+// Copyright 2020 Joyent, Inc.
+//
+
 use std::fmt;
 use std::ops;
-
-use lazy_static::lazy_static;
 use std::string::ToString;
 
+use lazy_static::lazy_static;
+
+///
 /// Describes the ability of a user to perform a certain action.
 ///
 /// Permissions can be mixed together like integers with `|` and `&`.
+///
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct Permission(u32);
 
@@ -136,6 +142,7 @@ mod tests {
     }
 }
 
+///
 /// An access control list.
 ///
 /// In general, the ACL system is similar to UNIX file access permissions, where znodes act as
@@ -146,20 +153,28 @@ mod tests {
 ///
 /// See the [ZooKeeper Programmer's Guide](https://zookeeper.apache.org/doc/current/zookeeperProgrammers.html#sc_ZooKeeperAccessControl)
 /// for more information.
+///
 #[derive(Clone, Debug, PartialEq)]
 pub struct Acl {
     /// The permissions associated with this ACL.
     pub perms: Permission,
+
+    ///
     /// The authentication scheme this list is used for. The most common scheme is `"auth"`, which
     /// allows any authenticated user to do anything (see `creator_all`).
+    ///
     pub scheme: String,
+    ///
     /// The ID of the user under the `scheme`. For example, with the `"ip"` `scheme`, this is an IP
     /// address or CIDR netmask.
+    ///
     pub id: String,
 }
 
 impl Acl {
+    ///
     /// Create a new ACL with the given `permissions`, `scheme`, and `id`.
+    ///
     pub fn new<T, U>(permissions: Permission, scheme: T, id: U) -> Acl
     where
         T: ToString,
@@ -172,17 +187,23 @@ impl Acl {
         }
     }
 
+    ///
     /// This ACL gives the creators authentication id's all permissions.
+    ///
     pub fn creator_all() -> &'static [Acl] {
         &ACL_CREATOR_ALL[..]
     }
 
+    ///
     /// This is a completely open ACL.
+    ///
     pub fn open_unsafe() -> &'static [Acl] {
         &ACL_OPEN_UNSAFE[..]
     }
 
+    ///
     /// This ACL gives the world the ability to read.
+    ///
     pub fn read_unsafe() -> &'static [Acl] {
         &ACL_READ_UNSAFE[..]
     }
